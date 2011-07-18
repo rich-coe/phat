@@ -8,7 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "hash.h"
+#include "rbt.h"
 
 #define MAGIC_HEADER 0x4a415641   // JAVA
 
@@ -16,7 +16,7 @@ struct jdump {          // java dump
     FILE *fin;
     int fVersion;
     unsigned int identsz;
-    pHashTable *sbTable, *cTable, *hTable;
+    rbt *sbTable, *cTable, *hTable;
 };
 
 struct hobj {           // heap object
@@ -26,6 +26,34 @@ struct hobj {           // heap object
     int htype;
     long long heapId;
 };
+
+struct _finfo {         // Field Info
+    long long ident;    // field identifier
+    char *name;         // [decoded] field name
+    char ftype;         // field type
+    int valsz;
+    union {
+        long long ident;
+        unsigned char b;
+        unsigned short c;
+        unsigned int i;
+        unsigned long long j;
+        float f;
+        double d;
+    } val;
+};
+typedef struct _finfo finfo;
+
+struct _cinfo {         // Class Info
+    long long ident, nident;
+    char *name;
+    unsigned long count;
+    long long superId, loaderId, signerId, domainId;
+    unsigned short cstats, cfields;
+    finfo *statics;
+    finfo *fields;
+};
+typedef struct _cinfo cinfo;
 
 int readVersion(FILE *fin);
 int readUint(FILE *fin, unsigned int *input);
@@ -37,10 +65,15 @@ char *hideSpecials(char *);
 
 int debug = 0;
 
-int
-iKeyEqual(void *a, void *b)
+cinfo *
+mkcinfo(rbt *tab, long long cid, long long nid, char *name)
 {
-    return ((long) a) == ((long ) b);
+    cinfo *ci = (cinfo *) talloc(tab->mem_ctx, cinfo);
+    ci->ident = cid;
+    ci->nident = nid;
+    ci->name = name;
+    ci->count = 0;
+    return ci;
 }
 
 int
@@ -74,7 +107,7 @@ readDump(char *dumpfile)
     unsigned long long date;
     time_t tdate;
     struct tm *ltime;
-    unsigned char rtype;
+    char rtype;
 
     df = (struct jdump *) malloc(sizeof(struct jdump));
 
@@ -119,9 +152,9 @@ readDump(char *dumpfile)
     ltime = localtime(&tdate);
     printf("Dump file created %s\n\n", ctime(&tdate));
 
-    df->sbTable = pHashNew(NULL, iKeyEqual);    // table of strings
-    df->cTable = pHashNew(NULL, iKeyEqual);     // table of classes
-    df->hTable = pHashNew(NULL, iKeyEqual);     // table of heap objs
+    df->sbTable = newrbt();    // table of strings
+    df->cTable = newrbt();     // table of classes
+    df->hTable = newrbt();     // table of heap objs
 
     while (EOF != (rtype = getc(df->fin))) {
         unsigned int rlen, ts, pos;
@@ -143,9 +176,8 @@ readDump(char *dumpfile)
         if (debug > 2)
             printf("0x%08x Read record 0x%02x : 0x%08x\t", pos, rtype, rlen);
 
-        switch (rtype) {
+        switch ((unsigned char) rtype) {
         case 0x01 : { // HPROF_UTF8
-            long key;
             long long ident = readIdent(df);
             int  slen = rlen - df->identsz;
             char *usb = calloc(1 + rlen - df->identsz, 1);
@@ -153,13 +185,13 @@ readDump(char *dumpfile)
             usb = hideSpecials(usb);
             if (debug)
             printf("0x%8x %s\n", ident, usb);
-            key = (long) ident;
-            pHashInsert(df->sbTable, (hptr) key, usb);
+            rbtInsert(df->sbTable, (long) ident, rbt_strdup(df->sbTable, usb));
+            free(usb);
             break;
         }
         case 0x02 : { // HPROF_LOAD_CLASS
             long key, nkey;
-            char *value;
+            cinfo *ci;
             int serial, stackNum;
             long long classId, classNameId;
 
@@ -174,13 +206,13 @@ readDump(char *dumpfile)
 
             key = (long) classId;
             nkey = (long) classNameId;
-            value = (char *) pHashLookup(df->sbTable, (hptr) nkey);
-            pHashInsert(df->cTable, (hptr) key, value);
+            ci = mkcinfo(df->cTable, classId, classNameId, (char *) rbtLookup(df->sbTable, nkey));
+            rbtInsert(df->cTable, key, ci);
             if (debug) {
             if (4 < df->identsz)
-                printf("0x%016lx classId 0x%08x 0x%016lx %s\n", classId, serial, classNameId, value);
+                printf("0x%016lx classId 0x%08x 0x%016lx %s\n", classId, serial, classNameId, ci->name);
             else
-                printf("0x%08lx classId 0x%08x 0x%08lx %s\n", classId, serial, classNameId, value);
+                printf("0x%08lx classId 0x%08x 0x%08lx %s\n", classId, serial, classNameId, ci->name);
             }
             break;
         }
@@ -301,9 +333,9 @@ readIdent(struct jdump *jf)
 }
 
 struct hobj *
-makeObj(int ht, long long cid)
+makeObj(rbt *tab, int ht, long long cid)
 {
-    struct hobj *ho = (struct hobj *) malloc(sizeof(struct hobj));
+    struct hobj *ho = (struct hobj *) talloc(tab->mem_ctx, struct hobj);
 
     ho->htype = ht;
     ho->heapId = cid;
@@ -354,81 +386,81 @@ sigFromType(unsigned char otype)
 }
 
 int
-readValue(struct jdump *jf)
+readValue(struct jdump *jf, finfo *fi)
 {
-    unsigned char rtype = getc(jf->fin);
+    fi->ftype = getc(jf->fin);
 
     if (1 <= jf->fVersion)
-        rtype = sigFromType(rtype);
+        fi->ftype = sigFromType(fi->ftype);
 
-    switch (rtype) {
+    switch (fi->ftype) {
     case '[' :
     case 'L' : {
-        long long ident = readIdent(jf);
-        return jf->identsz;
+        fi->val.ident = readIdent(jf);
+        return fi->valsz = jf->identsz;
     }
     case 'Z' : {
-        unsigned char b = getc(jf->fin);
-        if (0 != b && 1 != b) {
-            fprintf(stderr, "readValue: illegal bool read 0x%x\n", b);
+        fi->val.b = getc(jf->fin);
+        if (0 != fi->val.b && 1 != fi->val.b) {
+            fprintf(stderr, "readValue: illegal bool read 0x%x\n", fi->val.b);
             return -1;
         }
-        return 1;
+        return fi->valsz = 1;
     }
     case 'B' : {
-        unsigned char b = getc(jf->fin);
-        return 1;
+        fi->val.b = getc(jf->fin);
+        return fi->valsz = 1;
     }
     case 'S' : {
-        unsigned short s;
-        readUshort(jf->fin, &s);
-        return 2;
+        readUshort(jf->fin, &(fi->val.c));
+        return fi->valsz = 2;
     }
     case 'C' : {
-        unsigned short c;
-        readUshort(jf->fin, &c);
-        return 2;
+        readUshort(jf->fin, &(fi->val.c));
+        return fi->valsz = 2;
     }
     case 'I' : {
-        unsigned int i;
-        readUint(jf->fin, &i);
-        return 4;
+        readUint(jf->fin, &(fi->val.i));
+        return fi->valsz = 4;
     }
     case 'J' : {
-        unsigned long long j;
-        readUlong(jf->fin, &j);
-        return 8;
+        readUlong(jf->fin, &(fi->val.j));
+        return fi->valsz = 8;
     }
     case 'F' : {                // float
+        fi->val.f = 0.0;
         fseek(jf->fin, 4, SEEK_CUR);
-        return 4;
+        return fi->valsz = 4;
     }
     case 'D' : {                // double
+        fi->val.d = 0.0;
         fseek(jf->fin, 8, SEEK_CUR);
-        return 8;
+        return fi->valsz = 8;
     }
     default:
-    fprintf(stderr, "readValue: bad type sig 0x%x\n", rtype);
+    fprintf(stderr, "readValue: bad type sig 0x%x\n", fi->ftype);
     break;
     }
+    return 0;
 }
 
 int
 readClass(struct jdump *jf, unsigned int hsize)
 {
-    long long ident, superId, classId, signerId, domainId, res1, res2;
+    long long ident, res1, res2;
     unsigned int stackId, instsz;
-    unsigned short cpool, cstats, cfields;
-    char *name;
-    long key;
+    unsigned short cpool;
+    cinfo *ci;
     int i;
 
     ident = readIdent(jf);
+    ci = (cinfo *) rbtLookup(jf->cTable, (long) ident);
+
     readUint(jf->fin, &stackId);
-    superId = readIdent(jf);
-    classId = readIdent(jf);
-    signerId = readIdent(jf);
-    domainId = readIdent(jf);
+    ci->superId = readIdent(jf);
+    ci->loaderId = readIdent(jf);
+    ci->signerId = readIdent(jf);
+    ci->domainId = readIdent(jf);
     res1 = readIdent(jf);
     res2 = readIdent(jf);
     readUint(jf->fin, &instsz);
@@ -437,32 +469,35 @@ readClass(struct jdump *jf, unsigned int hsize)
     readUshort(jf->fin, &cpool);             // const pool entries
     hsize -= 2;
     for (i = 0; i < cpool; i++) {
+        finfo *fi = (finfo *) talloc(ci, finfo);
         unsigned short entry;
         readUshort(jf->fin, &entry);
         hsize -= 2;
-        hsize -= readValue(jf);
+        hsize -= readValue(jf, fi);
+        talloc_free(fi);
     }
 
-    readUshort(jf->fin, &cstats);             // statics
+    readUshort(jf->fin, &(ci->cstats));             // statics
+    ci->statics = talloc_array(ci, finfo, ci->cstats);
     hsize -= 2;
-    for (i = 0; i < cstats; i++) {
-        long long nameId = readIdent(jf);
+    for (i = 0; i < ci->cstats; i++) {
+        ci->statics[i].ident = readIdent(jf);
         hsize -= jf->identsz;
-        hsize -= 1 + readValue(jf);
+        hsize -= 1 + readValue(jf, &ci->statics[i]);
     }
 
-    readUshort(jf->fin, &cfields);             // fields
+    readUshort(jf->fin, &(ci->cfields));             // fields
+    ci->fields = talloc_array(ci, finfo, ci->cfields);
     hsize -= 2;
-    for (i = 0; i < cfields; i++) {
-        unsigned char rtype;
-        long long nameId = readIdent(jf);
-        rtype = getc(jf->fin);
+    for (i = 0; i < ci->cfields; i++) {
+        ci->fields[i].ident = readIdent(jf);
+        ci->fields[i].ftype = getc(jf->fin);
+        if (1 <= jf->fVersion)
+            ci->fields[i].ftype = sigFromType(ci->fields[i].ftype);
         hsize -= 1 + jf->identsz;
     }
-    key = (long) ident;
-    name = (char *) pHashLookup(jf->cTable, (hptr) key);
     if (debug)
-    printf("0x%x class %4d %4d %4d %s\n", ident, cpool, cstats, cfields, name);
+    printf("0x%x class %4d %4d %4d %s\n", ident, cpool, ci->cstats, ci->cfields, ci->name);
     // putchar('c');
 
     return hsize;
@@ -489,8 +524,10 @@ readArray(struct jdump *jf, unsigned hsize, int prim)
     } else {
         elemClassId = readIdent(jf);
         hsize -= jf->identsz;
-        if (debug)
-        printf("0x%x object array type %x %s\n", ide, elemClassId, (char *) pHashLookup(jf->cTable, (hptr) elemClassId));
+        if (debug) {
+            cinfo *ci = (cinfo *) rbtLookup(jf->cTable, elemClassId);
+            printf("0x%x object array type %x %s\n", ide, elemClassId, ci->name);
+        }
     }
     if (prim /* || version < 1 */) {
         switch (elemClassId) {
@@ -507,14 +544,36 @@ readArray(struct jdump *jf, unsigned hsize, int prim)
     if (0x00 != primSig) {
         fseek(jf->fin, elsz * isz, SEEK_CUR);
         hsize -= elsz * isz;
-        ho = makeObj(H_VARRAY, elemClassId);
+        // ho = makeObj(jf->hTable, H_VARRAY, elemClassId);
     } else {
         fseek(jf->fin, jf->identsz * isz, SEEK_CUR);
         hsize -= jf->identsz * isz;
-        ho = makeObj(H_OARRAY, elemClassId);
+        // ho = makeObj(jf->hTable, H_OARRAY, elemClassId);
     }
-    // pHashInsert(jf->hTable, (hptr) ide, ho);
+    // rbtInsert(jf->hTable, ide, ho);
     return hsize;
+}
+
+void
+prclass(trbt_node_t *node)
+{
+    cinfo *ci;
+    if (NULL == node)
+        return;
+    prclass(node->left);
+    ci = (cinfo *) node->data;
+    printf("0x%x instance 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
+    prclass(node->right);
+}
+
+void
+printclass(rbt *cTable)
+{
+    cinfo *ci;
+    prclass(cTable->t->root->left);
+    ci = (cinfo *) cTable->t->root->data;
+    printf("0x%x instance 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
+    prclass(cTable->t->root->right);
 }
 
 void
@@ -642,16 +701,19 @@ readHeap(struct jdump *jf, unsigned int hsize)
             long long ide, classId;
             unsigned int stackId, isz;
             struct hobj *ho;
+            cinfo *ci;
 
             ide = readIdent(jf);
             readUint(jf->fin, &stackId);
             classId = readIdent(jf);
             readUint(jf->fin, &isz);
             hsize -= isz + 8 + jf->identsz + jf->identsz;
+            ci = (cinfo *) rbtLookup(jf->cTable, classId);
+            ci->count++;
             if (debug)
-            printf("0x%x instance 0x%x %s\n", ide, classId, (char *) pHashLookup(jf->cTable, (hptr) classId));
-            ho = makeObj(H_INSTANCE, classId);
-            // pHashInsert(jf->hTable, (hptr) ide, ho);
+                printf("0x%x instance 0x%x %s\n", ide, classId, ci->name);
+            // ho = makeObj(jf->hTable, H_INSTANCE, classId);
+            // rbtInsert(jf->hTable, ide, ho);
             // putchar('i');
             fseek(jf->fin, isz, SEEK_CUR);
             inst++;
@@ -691,4 +753,6 @@ readHeap(struct jdump *jf, unsigned int hsize)
     printf("\t%15s : %8d \n", "instance", inst);
     printf("\t%15s : %8d \n", "object array", oarr);
     printf("\t%15s : %8d \n", "primary array", parr);
+    puts("Class Summary");
+    printclass(jf->cTable);
 }
