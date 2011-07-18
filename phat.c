@@ -7,8 +7,10 @@
 #include <endian.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
-#include "rbt.h"
+#include "talloc.h"
+#include "rbtree.h"
 
 #define MAGIC_HEADER 0x4a415641   // JAVA
 
@@ -16,7 +18,12 @@ struct jdump {          // java dump
     FILE *fin;
     int fVersion;
     unsigned int identsz;
-    rbt *sbTable, *cTable, *hTable;
+    trbt_tree_t *sbTable,               // string const table
+        *cTable,                // class table, by ident
+        *hTable,                // object table
+        *rsbTable,              // revers string table, by name
+        *rcTable;               // reverse class table, by name
+    struct _cinfo *javaLangClass, *javaLangString, *javaLangClassLoader;
 };
 
 struct hobj {           // heap object
@@ -31,6 +38,7 @@ struct _finfo {         // Field Info
     long long ident;    // field identifier
     char *name;         // [decoded] field name
     char ftype;         // field type
+    char resolved;      // passed through resolver
     int valsz;
     union {
         long long ident;
@@ -50,6 +58,8 @@ struct _cinfo {         // Class Info
     unsigned long count;
     long long superId, loaderId, signerId, domainId;
     unsigned short cstats, cfields;
+    int tfields;
+    char resolved;
     finfo *statics;
     finfo *fields;
 };
@@ -66,13 +76,13 @@ char *hideSpecials(char *);
 int debug = 0;
 
 cinfo *
-mkcinfo(rbt *tab, long long cid, long long nid, char *name)
+mkcinfo(trbt_tree_t *tab, long long cid, long long nid, char *name)
 {
-    cinfo *ci = (cinfo *) talloc(tab->mem_ctx, cinfo);
+    cinfo *ci = (cinfo *) talloc(tab, cinfo);
     ci->ident = cid;
     ci->nident = nid;
     ci->name = name;
-    ci->count = 0;
+    ci->tfields = ci->resolved = ci->count = 0;
     return ci;
 }
 
@@ -152,9 +162,11 @@ readDump(char *dumpfile)
     ltime = localtime(&tdate);
     printf("Dump file created %s\n\n", ctime(&tdate));
 
-    df->sbTable = newrbt();    // table of strings
-    df->cTable = newrbt();     // table of classes
-    df->hTable = newrbt();     // table of heap objs
+    df->sbTable = trbt_create(NULL, 0);    // table of strings
+    // df->rsbTable = trbt_create(NULL, 0);   // reverse lookup of sbTable
+    df->cTable = trbt_create(NULL, 0);     // table of classes
+    df->rcTable = trbt_create(NULL, 0);    // reverse lookup of cTable
+    df->hTable = trbt_create(NULL, 0);     // table of heap objs
 
     while (EOF != (rtype = getc(df->fin))) {
         unsigned int rlen, ts, pos;
@@ -178,18 +190,20 @@ readDump(char *dumpfile)
 
         switch ((unsigned char) rtype) {
         case 0x01 : { // HPROF_UTF8
+            unsigned long skey = crc32(0, Z_NULL, 0);;
             long long ident = readIdent(df);
             int  slen = rlen - df->identsz;
-            char *usb = calloc(1 + rlen - df->identsz, 1);
+            char *usb = talloc_zero_array(df->sbTable, char, 1 + rlen - df->identsz);
             rc = fread(usb, 1, slen, df->fin);
             usb = hideSpecials(usb);
             if (debug)
             printf("0x%8x %s\n", ident, usb);
-            rbtInsert(df->sbTable, (long) ident, rbt_strdup(df->sbTable, usb));
-            free(usb);
+            trbt_insert32(df->sbTable, (long) ident, usb);
+            // trbt_insert32(df->rsbTable, crc32(skey, usb, slen), (void *) ident);
             break;
         }
         case 0x02 : { // HPROF_LOAD_CLASS
+            unsigned long ckey = crc32(0, Z_NULL, 0);
             long key, nkey;
             cinfo *ci;
             int serial, stackNum;
@@ -206,8 +220,10 @@ readDump(char *dumpfile)
 
             key = (long) classId;
             nkey = (long) classNameId;
-            ci = mkcinfo(df->cTable, classId, classNameId, (char *) rbtLookup(df->sbTable, nkey));
-            rbtInsert(df->cTable, key, ci);
+            ci = mkcinfo(df->cTable, classId, classNameId, (char *) trbt_lookup32(df->sbTable, nkey));
+            trbt_insert32(df->cTable, key, ci);
+            ckey = crc32(ckey, ci->name, strlen(ci->name));
+            trbt_insert32(df->rcTable, ckey, ci);
             if (debug) {
             if (4 < df->identsz)
                 printf("0x%016lx classId 0x%08x 0x%016lx %s\n", classId, serial, classNameId, ci->name);
@@ -333,9 +349,9 @@ readIdent(struct jdump *jf)
 }
 
 struct hobj *
-makeObj(rbt *tab, int ht, long long cid)
+makeObj(trbt_tree_t *tab, int ht, long long cid)
 {
-    struct hobj *ho = (struct hobj *) talloc(tab->mem_ctx, struct hobj);
+    struct hobj *ho = (struct hobj *) talloc(tab, struct hobj);
 
     ho->htype = ht;
     ho->heapId = cid;
@@ -454,7 +470,7 @@ readClass(struct jdump *jf, unsigned int hsize)
     int i;
 
     ident = readIdent(jf);
-    ci = (cinfo *) rbtLookup(jf->cTable, (long) ident);
+    ci = (cinfo *) trbt_lookup32(jf->cTable, (long) ident);
 
     readUint(jf->fin, &stackId);
     ci->superId = readIdent(jf);
@@ -478,23 +494,29 @@ readClass(struct jdump *jf, unsigned int hsize)
     }
 
     readUshort(jf->fin, &(ci->cstats));             // statics
-    ci->statics = talloc_array(ci, finfo, ci->cstats);
     hsize -= 2;
-    for (i = 0; i < ci->cstats; i++) {
-        ci->statics[i].ident = readIdent(jf);
-        hsize -= jf->identsz;
-        hsize -= 1 + readValue(jf, &ci->statics[i]);
+    if (0 < ci->cstats) {
+        ci->statics = talloc_array(ci, finfo, ci->cstats);
+        for (i = 0; i < ci->cstats; i++) {
+            ci->statics[i].ident = readIdent(jf);
+            ci->statics[i].resolved = 0;
+            hsize -= jf->identsz;
+            hsize -= 1 + readValue(jf, &ci->statics[i]);
+        }
     }
 
     readUshort(jf->fin, &(ci->cfields));             // fields
-    ci->fields = talloc_array(ci, finfo, ci->cfields);
     hsize -= 2;
-    for (i = 0; i < ci->cfields; i++) {
-        ci->fields[i].ident = readIdent(jf);
-        ci->fields[i].ftype = getc(jf->fin);
-        if (1 <= jf->fVersion)
-            ci->fields[i].ftype = sigFromType(ci->fields[i].ftype);
-        hsize -= 1 + jf->identsz;
+    if (0 < ci->cfields) {
+        ci->fields = talloc_array(ci, finfo, ci->cfields);
+        for (i = 0; i < ci->cfields; i++) {
+            ci->fields[i].ident = readIdent(jf);
+            ci->fields[i].ftype = getc(jf->fin);
+            ci->fields[i].resolved = 0;
+            if (1 <= jf->fVersion)
+                ci->fields[i].ftype = sigFromType(ci->fields[i].ftype);
+            hsize -= 1 + jf->identsz;
+        }
     }
     if (debug)
     printf("0x%x class %4d %4d %4d %s\n", ident, cpool, ci->cstats, ci->cfields, ci->name);
@@ -525,7 +547,7 @@ readArray(struct jdump *jf, unsigned hsize, int prim)
         elemClassId = readIdent(jf);
         hsize -= jf->identsz;
         if (debug) {
-            cinfo *ci = (cinfo *) rbtLookup(jf->cTable, elemClassId);
+            cinfo *ci = (cinfo *) trbt_lookup32(jf->cTable, elemClassId);
             printf("0x%x object array type %x %s\n", ide, elemClassId, ci->name);
         }
     }
@@ -550,7 +572,7 @@ readArray(struct jdump *jf, unsigned hsize, int prim)
         hsize -= jf->identsz * isz;
         // ho = makeObj(jf->hTable, H_OARRAY, elemClassId);
     }
-    // rbtInsert(jf->hTable, ide, ho);
+    // trbt_insert32(jf->hTable, ide, ho);
     return hsize;
 }
 
@@ -567,13 +589,91 @@ prclass(trbt_node_t *node)
 }
 
 void
-printclass(rbt *cTable)
+printclass(trbt_tree_t *cTable)
 {
     cinfo *ci;
-    prclass(cTable->t->root->left);
-    ci = (cinfo *) cTable->t->root->data;
+    prclass(cTable->root->left);
+    ci = (cinfo *) cTable->root->data;
     printf("0x%x instance 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
-    prclass(cTable->t->root->right);
+    prclass(cTable->root->right);
+}
+
+cinfo *
+findClass(struct jdump *jf, char *cname)
+{
+    unsigned long ckey = crc32(0, Z_NULL, 0);
+    ckey = crc32(ckey, cname, strlen(cname));
+    return (cinfo *) trbt_lookup32(jf->rcTable, ckey);
+}
+
+int
+resolveSClassSize(struct jdump *jf, cinfo *ci)
+{
+    cinfo *super;
+
+    if (0 == ci->superId)
+        return;
+
+    super = (cinfo *) trbt_lookup32(jf->cTable, ci->superId);
+    return ci->cfields + resolveSuperclass(jf, super);
+}
+
+void
+resolveField(struct jdump *jf, finfo *fi)
+{
+    if (fi->resolved)
+        return;
+    fi->name = (char *) trbt_lookup32(jf->sbTable, (long) fi->ident);
+#ifdef notdef
+    switch (fi->ftype) {
+    case 'L':
+    case '[':
+    }
+#endif
+    fi->resolved = 1;
+}
+
+void
+resClassNode(struct jdump *jf, cinfo *ci)
+{
+    cinfo *super;
+    int i;
+    if (ci->resolved)
+        return;
+    ci->tfields = ci->cfields + resolveSClassSize(jf, ci);
+
+    // loader
+    // signers
+    // domain
+
+    for (i = 0; i < ci->cstats; i++) 
+        resolveField(jf, ci->statics + i);
+
+    if (0 != (super = (cinfo *) trbt_lookup32(jf->cTable, ci->superId)))
+        resClassNode(jf, super);
+    ci->resolved = 1;
+}
+
+void
+resClass(struct jdump *jf, trbt_node_t *cnode)
+{
+    if (NULL == cnode)
+        return;
+    resClass(jf, cnode->left);
+    resClassNode(jf, (cinfo *) cnode->data);
+    resClass(jf, cnode->right);
+}
+
+void
+resolveClass(struct jdump *jf)
+{
+    jf->javaLangClass = findClass(jf, "java/lang/Class");
+    jf->javaLangString = findClass(jf, "java/lang/String");
+    jf->javaLangClassLoader = findClass(jf, "java/lang/ClassLoader");
+
+    resClass(jf, jf->cTable->root->left);
+    resClassNode(jf, (cinfo *) jf->cTable->root->data);
+    resClass(jf, jf->cTable->root->right);
 }
 
 void
@@ -708,12 +808,12 @@ readHeap(struct jdump *jf, unsigned int hsize)
             classId = readIdent(jf);
             readUint(jf->fin, &isz);
             hsize -= isz + 8 + jf->identsz + jf->identsz;
-            ci = (cinfo *) rbtLookup(jf->cTable, classId);
+            ci = (cinfo *) trbt_lookup32(jf->cTable, classId);
             ci->count++;
             if (debug)
                 printf("0x%x instance 0x%x %s\n", ide, classId, ci->name);
             // ho = makeObj(jf->hTable, H_INSTANCE, classId);
-            // rbtInsert(jf->hTable, ide, ho);
+            // trbt_insert32(jf->hTable, ide, ho);
             // putchar('i');
             fseek(jf->fin, isz, SEEK_CUR);
             inst++;
@@ -753,6 +853,9 @@ readHeap(struct jdump *jf, unsigned int hsize)
     printf("\t%15s : %8d \n", "instance", inst);
     printf("\t%15s : %8d \n", "object array", oarr);
     printf("\t%15s : %8d \n", "primary array", parr);
+
+    resolveClass(jf);
+
     puts("Class Summary");
     printclass(jf->cTable);
 }
