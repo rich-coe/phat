@@ -25,6 +25,17 @@ struct jdump {          // java dump
         *rsbTable,              // revers string table, by name
         *rcTable;               // reverse class table, by name
     struct _cinfo *javaLangClass, *javaLangString, *javaLangClassLoader;
+    char *fclass;
+};
+
+union hvalue {
+    long long ident;
+    unsigned char b;
+    unsigned short c;
+    unsigned int i;
+    unsigned long long j;
+    float f;
+    double d;
 };
 
 struct _hobject {           // heap object
@@ -37,15 +48,7 @@ struct _hobject {           // heap object
     char resolved, visit;
     unsigned int count;
     int size;
-    union {
-        long long *ident;
-        unsigned char *b;
-        unsigned short *c;
-        unsigned int *i;
-        unsigned long long *j;
-        float *f;
-        double *d;
-    } val;
+    union hvalue *hvalues;
 };
 typedef struct _hobject hobject;
 
@@ -56,15 +59,6 @@ struct _finfo {         // Field Info
     char resolved;      // passed through resolver
     int valsz;          // sizeof object
     off_t offset;       // for resolved objects
-    union {
-        long long ident;
-        unsigned char b;
-        unsigned short c;
-        unsigned int i;
-        unsigned long long j;
-        float f;
-        double d;
-    } val;
 };
 typedef struct _finfo finfo;
 
@@ -76,7 +70,7 @@ struct _cinfo {         // Class Info
     unsigned short cstats, cfields;
     int tfields;
     char resolved;
-    finfo *statics;
+    hobject *statics;
     finfo *fields;              // this class's fields, self
     finfo **values;             // this class's value fields, self + super(s)
 };
@@ -86,11 +80,13 @@ int readVersion(FILE *fin);
 int readUint(FILE *fin, unsigned int *input);
 int readUlong(FILE *fin, unsigned long long *input);
 long long readIdent(struct jdump *);
-struct jdump *readDump(char *dumpfile);
+struct jdump *readDump(char *findclass, char *dumpfile);
 void readHeap(struct jdump *, unsigned int hsize);
 char *hideSpecials(char *);
 
 int debug = 0;
+
+extern int optind;
 
 cinfo *
 mkcinfo(trbt_tree_t *tab, long long cid, long long nid, char *name)
@@ -108,25 +104,30 @@ main(int argc, char **argv)
 {
     int opt;
     char *baseline = NULL;
+    char *findclass = NULL;
     struct jdump *df, *bf;
 
-    while (-1 != (opt = getopt(argc, argv, "b:d"))) {
+    while (-1 != (opt = getopt(argc, argv, "b:C:d"))) {
     switch (opt) {
     case 'b': baseline = strdup(optarg); break;
     case 'd': debug++; break;
+    case 'C': findclass = strdup(optarg); break;
+    default: 
+        printf("opt %d\n");
+        break;
     }
     }
 
-    df = readDump(argv[optind]);
+    df = readDump(findclass, argv[optind]);
     if (baseline) {
-        bf = readDump(baseline);
+        bf = readDump(NULL, baseline);
     }
 
     exit(0);
 }
 
 struct jdump *
-readDump(char *dumpfile) 
+readDump(char *fclass, char *dumpfile) 
 {
     struct jdump *df;
     int rc;
@@ -137,6 +138,8 @@ readDump(char *dumpfile)
     char rtype;
 
     df = (struct jdump *) malloc(sizeof(struct jdump));
+
+    df->fclass = fclass;
 
     if (NULL == (df->fin = fopen(dumpfile, "r"))) {
         fprintf(stderr, "cannot open '%s' for reading, errno %d\n", dumpfile, errno);
@@ -250,12 +253,17 @@ readDump(char *dumpfile)
             break;
         }
         case 0x05 : { // HPROF_TRACE
-            int serial, threadSeq, frames;
+            int i, serial, threadSeq, frames;
             readUint(df->fin, &serial);             // serialNumber
             readUint(df->fin, &threadSeq);
             readUint(df->fin, &frames);
             if (debug)
             printf("trace serial %d %d %d\n", serial, threadSeq, frames);
+            for (i = 0; i < frames; i++) {
+                long long ident = readIdent(df);
+                if (debug)
+                    printf("\tident 0x%x\n", ident);
+            }
             break;
         }
         case 0x0c : { // HPROF_HEAP_DUMP
@@ -264,6 +272,7 @@ readDump(char *dumpfile)
             break;
         }
         default:
+            if (debug) puts("");
             fseek(df->fin, rlen, SEEK_CUR);
             break;
         }
@@ -422,59 +431,59 @@ sigFromType(unsigned char otype)
 }
 
 int
-readValue(struct jdump *jf, finfo *fi)
+readValue(struct jdump *jf, hobject *ho)
 {
-    fi->ftype = getc(jf->fin);
+    ho->htype = getc(jf->fin);
 
     if (1 <= jf->fVersion)
-        fi->ftype = sigFromType(fi->ftype);
+        ho->htype = sigFromType(ho->htype);
 
-    switch (fi->ftype) {
+    switch (ho->htype) {
     case '[' :
     case 'L' : {
-        fi->val.ident = readIdent(jf);
-        return fi->valsz = jf->identsz;
+        ho->hvalues[0].ident = readIdent(jf);
+        return jf->identsz;
     }
     case 'Z' : {
-        fi->val.b = getc(jf->fin);
-        if (0 != fi->val.b && 1 != fi->val.b) {
-            fprintf(stderr, "readValue: illegal bool read 0x%x\n", fi->val.b);
+        ho->hvalues[0].b = getc(jf->fin);
+        if (0 != ho->hvalues[0].b && 1 != ho->hvalues[0].b) {
+            fprintf(stderr, "readValue: illegal bool read 0x%x\n", ho->hvalues[0].b);
             return -1;
         }
-        return fi->valsz = 1;
+        return 1;
     }
     case 'B' : {
-        fi->val.b = getc(jf->fin);
-        return fi->valsz = 1;
+        ho->hvalues[0].b = getc(jf->fin);
+        return 1;
     }
     case 'S' : {
-        readUshort(jf->fin, &(fi->val.c));
-        return fi->valsz = 2;
+        readUshort(jf->fin, &(ho->hvalues[0].c));
+        return 2;
     }
     case 'C' : {
-        readUshort(jf->fin, &(fi->val.c));
-        return fi->valsz = 2;
+        readUshort(jf->fin, &(ho->hvalues[0].c));
+        return 2;
     }
     case 'I' : {
-        readUint(jf->fin, &(fi->val.i));
-        return fi->valsz = 4;
+        readUint(jf->fin, &(ho->hvalues[0].i));
+        return 4;
     }
     case 'J' : {
-        readUlong(jf->fin, &(fi->val.j));
-        return fi->valsz = 8;
+        readUlong(jf->fin, &(ho->hvalues[0].j));
+        return 8;
     }
     case 'F' : {                // float
-        fi->val.f = 0.0;
+        ho->hvalues[0].f = 0.0;
         fseek(jf->fin, 4, SEEK_CUR);
-        return fi->valsz = 4;
+        return 4;
     }
     case 'D' : {                // double
-        fi->val.d = 0.0;
+        ho->hvalues[0].d = 0.0;
         fseek(jf->fin, 8, SEEK_CUR);
-        return fi->valsz = 8;
+        return 8;
     }
     default:
-    fprintf(stderr, "readValue: bad type sig 0x%x\n", fi->ftype);
+    fprintf(stderr, "readValue: bad type sig 0x%x\n", ho->htype);
     break;
     }
     return 0;
@@ -505,23 +514,26 @@ readClass(struct jdump *jf, unsigned int hsize)
     readUshort(jf->fin, &cpool);             // const pool entries
     hsize -= 2;
     for (i = 0; i < cpool; i++) {
-        finfo *fi = (finfo *) talloc(ci, finfo);
+        hobject sho;
+        union hvalue hv;
         unsigned short entry;
+
+        sho.hvalues = &hv;
         readUshort(jf->fin, &entry);
         hsize -= 2;
-        hsize -= readValue(jf, fi);
-        talloc_free(fi);
+        hsize -= readValue(jf, &sho);
     }
 
     readUshort(jf->fin, &(ci->cstats));             // statics
     hsize -= 2;
     if (0 < ci->cstats) {
-        ci->statics = talloc_array(ci, finfo, ci->cstats);
+        ci->statics = talloc_array(ci, hobject, ci->cstats);
         for (i = 0; i < ci->cstats; i++) {
-            ci->statics[i].ident = readIdent(jf);
+            ci->statics[i].instId = readIdent(jf);
             ci->statics[i].resolved = 0;
+            ci->statics[i].hvalues = talloc(ci, union hvalue);
             hsize -= jf->identsz;
-            hsize -= 1 + readValue(jf, &ci->statics[i]);
+            hsize -= 1 + readValue(jf, ci->statics + i);
         }
     }
 
@@ -603,15 +615,42 @@ readArray(struct jdump *jf, unsigned hsize, int prim)
 }
 
 void
-printClass(trbt_node_t *node)
+printClass_r(trbt_node_t *node)
 {
     cinfo *ci;
     if (NULL == node)
         return;
-    printClass(node->left);
+    printClass_r(node->left);
     ci = (cinfo *) node->data;
     printf("0x%x instance 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
-    printClass(node->right);
+    printClass_r(node->right);
+}
+
+void
+printClass(trbt_node_t *node)
+{
+    trbt_node_t **stack = (trbt_node_t **) malloc(sizeof(trbt_node_t *) * 20);
+    int curr = 0, size = 20;
+
+    while (node) {
+        cinfo *ci = (cinfo *) node->data;
+        printf("0x%x instance 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
+        if (node->right) {
+            if (curr == size) {
+                stack = (trbt_node_t **) realloc(stack, sizeof(trbt_node_t *) * (size + 20));
+                size += 20;
+            }
+            stack[curr++] = node->right;
+        }
+        if (node->left) {
+            node = node->left;
+            continue;
+        }
+        if (0 < curr)
+            node = stack[--curr];
+        else 
+            node = NULL;
+    }
 }
 
 unsigned long
@@ -640,12 +679,12 @@ resolveSClassSize(struct jdump *jf, cinfo *ci)
 }
 
 void
-resolveField(struct jdump *jf, finfo *fi)
+resolveField(struct jdump *jf, hobject *fi)
 {
     if (fi->resolved)
         return;
-    fi->name = (char *) trbt_lookup32(jf->sbTable, (long) fi->ident);
 #ifdef notdef
+    fi->name = (char *) trbt_lookup32(jf->sbTable, (long) fi->ident);
     switch (fi->ftype) {
     case 'L':
     case '[':
@@ -756,30 +795,31 @@ resolveInstance(struct jdump *jf, hobject *ho)
     ho->resolved = 1;
 
     if (H_VARRAY == ho->htype) {
+        ho->hvalues = talloc_array(ho, union hvalue, ho->count);
         if (0 == ho->count)
             return;
         fseeko(jf->fin, ho->fpos, SEEK_SET);
         switch (ho->classId) {
         case 4: case 8: { // BOOLEAN, BYTE
-            ho->val.b = (char *) talloc_array(ho, char, ho->count);
-            fread(ho->val.b, sizeof(char), ho->count, jf->fin);
+            char *b = (char *) ho->hvalues;
+            fread(b, sizeof(char), ho->count, jf->fin);
             break;
         }
         case 5: case 9: {       // CHAR, SHORT
-            ho->val.c = (unsigned short *) talloc_array(ho, unsigned short, ho->count);
-            fread(ho->val.c, sizeof(unsigned short), ho->count, jf->fin);
+            unsigned short *c = (unsigned short *) ho->hvalues;
+            fread(c, sizeof(unsigned short), ho->count, jf->fin);
             break;
         }
         case 6: case 7:         // FLOAT, DOUBLE
             break;
         case 10: {              // INT
-            ho->val.i = (unsigned int *) talloc_array(ho, unsigned int, ho->count);
-            fread(ho->val.i, sizeof(unsigned int), ho->count, jf->fin);
+            unsigned int *i = (unsigned int *) ho->hvalues;
+            fread(i, sizeof(unsigned int), ho->count, jf->fin);
             break;
         }
         case 11: {              // LONG
-            ho->val.j = (unsigned long long *) talloc_array(ho, unsigned long long, ho->count);
-            fread(ho->val.j, sizeof(unsigned long long), ho->count, jf->fin);
+            unsigned long long *j = (unsigned long long *) ho->hvalues;
+            fread(j, sizeof(unsigned long long), ho->count, jf->fin);
             break;
         }
         }
@@ -788,11 +828,11 @@ resolveInstance(struct jdump *jf, hobject *ho)
         if (0 == ho->count)
             return;
         fseeko(jf->fin, ho->fpos, SEEK_SET);
-        ho->val.ident = (long long *) talloc_array(ho, long long, ho->count);
+        ho->hvalues = talloc_array(ho, union hvalue, ho->count);
         for (i = 0; i < ho->count; i++) 
-            *(ho->val.ident + i) = readIdent(jf);
+            (ho->hvalues + i)->ident = readIdent(jf);
         for (i = 0; i < ho->count; i++) {
-            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) *(ho->val.ident + i));
+            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (ho->hvalues + i)->ident);
             if (dref)
                 resolveInstance(jf, dref);
         }
@@ -801,34 +841,37 @@ resolveInstance(struct jdump *jf, hobject *ho)
     
     ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
 
+    if (ci->tfields)
+        ho->hvalues = talloc_array(ho, union hvalue, ci->tfields);
     for (i = 0; i < ci->tfields; i++) {
-        finfo *value = *(ci->values + i);
+        finfo *info = *(ci->values + i);
+        union hvalue *value = (ho->hvalues + i);
         fseeko(jf->fin, ho->fpos, SEEK_SET);
-        fseek(jf->fin, value->offset, SEEK_CUR);
-        switch (value->ftype) {
+        fseek(jf->fin, info->offset, SEEK_CUR);
+        switch (info->ftype) {
         case '[': 
         case 'L': {
-            value->val.ident = readIdent(jf);
-            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->val.ident);
+            value->ident = readIdent(jf);
+            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident);
             if (0 && !dref) 
                 fprintf(stderr, "resolveInstance: cannot resolve Instance 0x%08x in 0x%08x of 0x%08x %s\n",
-                    value->val.ident, ho->instId, ho->classId, ci->name);
+                    value->ident, ho->instId, ho->classId, ci->name);
             if (dref)
                 resolveInstance(jf, dref);
             break;
         }
         case 'Z' : case 'B':
-            value->val.b = getc(jf->fin); break;
+            value->b = getc(jf->fin); break;
         case 'S' :
-        case 'C' : readUshort(jf->fin, &(value->val.c)); break;
-        case 'I' : readUint(jf->fin, &(value->val.i)); break;
-        case 'J' : readUlong(jf->fin, &(value->val.j)); break;
+        case 'C' : readUshort(jf->fin, &(value->c)); break;
+        case 'I' : readUint(jf->fin, &(value->i)); break;
+        case 'J' : readUlong(jf->fin, &(value->j)); break;
         }
     }
 }
 
 void
-printInstance(struct jdump *jf, hobject *ho, int indent)
+printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
 {
     int i;
     cinfo *ci;
@@ -839,62 +882,104 @@ printInstance(struct jdump *jf, hobject *ho, int indent)
     }
     if (H_VARRAY == ho->htype) {
         printf("value array 0x%08x 0x%08x count %d\n", ho->instId, ho->classId, ho->count);
+        if (ho->count) {
+        if (indent) fputs("\t\t", stdout);
         for (i = 0; i < ho->count; i++) {
             switch (ho->classId) {
-            case 4: case 8:   printf("%c %x ", *(ho->val.b + i)); break;
-            case 5: case 9:   printf("%d ", *(ho->val.c + i)); break;
-            case 10:   printf("%d ", *(ho->val.i + i)); break;
-            case 11:   printf("%ld ", *(ho->val.j + i)); break;
+            case 4: case 8: {
+                char *b = (char *) ho->hvalues;
+                printf("%x ", *(b + i)); break; }
+            case 5: {
+                unsigned short *c = (unsigned short *) ho->hvalues;
+                putchar(*(c + i) >> 8); break; }
+            case 9: {
+                unsigned short *c = (unsigned short *) ho->hvalues;
+                printf("%x ", *(c + i)); break; }
+            case 10: {
+                unsigned int *pi = (unsigned int *) ho->hvalues;
+                printf("%x ", *(pi + i)); break; }
+            case 11: {
+                unsigned long long *j = (unsigned long long *) ho->hvalues;
+                printf("%lx ", *(j + i)); break; }
             }
+        }
+        puts("");
         }
         return;
     } else if (H_OARRAY == ho->htype) {
         printf("object array 0x%08x 0x%08x count %d\n", ho->instId, ho->classId, ho->count);
+        if (ho->count) {
         for (i = 0; i < ho->count; i++) {
+            if (indent) fputs("\t\t\t", stdout);
             if (5 < i) {
                 puts("[....]");
                 break;
             }
-            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) *(ho->val.ident + i));
+            unsigned long long *pid = (unsigned long long *) ho->hvalues;
+            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) *(pid + i));
             if (dref)
-                printInstance(jf, dref, 0);
+                printInstance(jf, dref, 1 + indent, 1);
             else
-                printf("Instance 0x%08x of 0x%08x %s\n", *(ho->val.ident + i), 0, "unknown");
+                printf("Instance 0x%08x of 0x%08x %s\n", *(pid + i), 0, "unknown");
+        }
         }
         return;
     }
 
     ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
     ho->visit = 1;
+    // if (indent) fputs("\t\t", stdout);
     printf("Instance 0x%08x of 0x%08x %s\n", ho->instId, ho->classId, ci->name);
+    if (pshort) {
+        ho->visit = 0;
+        return;
+    }
     if (indent)
-        printf("---- (%d)\n", indent);
+        printf("\t\t----> (%d)\n", indent);
     for (i = 0; i < ci->tfields; i++) {
-        finfo *value = *(ci->values + i);
+        finfo *info = *(ci->values + i);
+        union hvalue *value = ho->hvalues + i;
         
         if (indent) fputs("\t", stdout);
-        printf("\t%3d (%3d): %c %-25s ", i, value->offset, value->ftype, value->name);
-        switch (value->ftype) {
+        printf("\t%3d (%3d): %c %-25s ", i, info->offset, info->ftype, info->name);
+        switch (info->ftype) {
         case '[' :
         case 'L' : {
-            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->val.ident);
-            if (dref)
-                printInstance(jf, dref, 1 + indent);
-            else
-                printf("Instance 0x%08x of 0x%08x %s\n", value->val.ident, 0, "unknown");
+            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident);
+            if (dref) {
+                printInstance(jf, dref, 1 + indent, 1);
+            } else
+                printf("Instance 0x%08x of 0x%08x %s\n", value->ident, 0, "unknown");
             break;
         }
         case 'B' :
-        case 'Z' :  printf(" %c  0x%x\n", value->val.b, value->val.b);  break;
+        case 'Z' :  printf(" %d  0x%x\n", value->b, value->b);  break;
         case 'C' :
-        case 'S' :  printf(" %d  0x%x\n", value->val.c, value->val.c);  break;
-        case 'I' :  printf(" %d  0x%x\n", value->val.i, value->val.i);  break;
-        case 'J' :  printf(" %ld  0x%lx\n", value->val.j, value->val.j);  break;
+        case 'S' :  printf(" %d  0x%x\n", value->c, value->c);  break;
+        case 'I' :  printf(" %d  0x%x\n", value->i, value->i);  break;
+        case 'J' :  printf(" %ld  0x%lx\n", value->j, value->j);  break;
         default: puts(" 0 0 ");
         }
     }
     if (indent)
-        printf("---- (%d)\n", indent);
+        printf("\t\t<---- (%d)\n", indent);
+    fflush(stdout);
+
+    for (i = 0; i < ci->tfields; i++) {
+        finfo *info = *(ci->values + i);
+        union hvalue *value = ho->hvalues + i;
+        switch (info->ftype) {
+        case '[' :
+        case 'L' : {
+            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident);
+            if (dref)
+                printInstance(jf, dref, indent, 0);
+            break;
+            }
+        default:  break;
+        }
+    }
+        
     ho->visit = 0;
 }
 
@@ -908,7 +993,7 @@ collectStats(struct jdump *jf, trbt_node_t *node, unsigned long ckey)
     ho = (hobject *) node->data;
     if (ckey == ho->classId) {
         resolveInstance(jf, ho);
-        printInstance(jf, ho, 0);
+        printInstance(jf, ho, 0, 0);
     }
     collectStats(jf, node->right, ckey);
 }
@@ -1115,10 +1200,15 @@ readHeap(struct jdump *jf, unsigned int hsize)
     resolveClasses(jf);
 
     puts("Class Summary");
-    printClass(jf->cTable->root);
+    printClass_r(jf->cTable->root);
 
-    {
-        cinfo *cdata = findClass(jf, "com/teramedica/web/actions/notification/TMNotificationListAction");
-        collectStats(jf, jf->hTable->root, (long) cdata->ident);
+    if (jf->fclass) {
+        // cinfo *cdata = findClass(jf, "com/teramedica/web/actions/notification/TMNotificationListAction");
+        // cinfo *cdata = findClass(jf, "java/util/concurrent/ConcurrentHashMap$Segment");
+        cinfo *cdata = findClass(jf, jf->fclass);
+        if (cdata)
+            collectStats(jf, jf->hTable->root, (long) cdata->ident);
+        else 
+            printf("findclass: \'%s\' not found\n");
     }
 }
