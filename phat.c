@@ -83,6 +83,7 @@ long long readIdent(struct jdump *);
 struct jdump *readDump(char *findclass, char *dumpfile);
 void readHeap(struct jdump *, unsigned int hsize);
 char *hideSpecials(char *);
+void resolveInstance(struct jdump *jf, hobject *ho);
 
 int debug = 0;
 
@@ -776,12 +777,23 @@ resolveClass(struct jdump *jf, trbt_node_t *cnode)
 }
 
 void
+resolveInstances(struct jdump *jf, trbt_node_t *cnode)
+{
+    if (NULL == cnode)
+        return;
+    resolveInstances(jf, cnode->left);
+    resolveInstance(jf, (hobject *) cnode->data);
+    resolveInstances(jf, cnode->right);
+}
+
+void
 resolveClasses(struct jdump *jf)
 {
     jf->javaLangClass = findClass(jf, "java/lang/Class");
     jf->javaLangClassLoader = findClass(jf, "java/lang/ClassLoader");
 
     resolveClass(jf, jf->cTable->root);
+    resolveInstances(jf, jf->hTable->root);
 }
 
 void
