@@ -29,8 +29,8 @@ struct jdump {          // java dump
 };
 
 struct _arc {
-    struct _hobject *parent;            // source vertice of arc
-    struct _hobject *child;             // dest vertice of arc
+    struct _cinfo *parent;            // source vertice of arc
+    struct _cinfo *child;             // dest vertice of arc
 
     struct _arc *next_parent, *next_child;
 
@@ -63,21 +63,12 @@ struct _hobject {           // heap object
     int htype;
     long long instId, classId;
     long fpos;
+    long xclassId;
     char resolved, visit;
     unsigned int count;
     int size;
+    unsigned long osize, csize;
     union hvalue *hvalues;
-                        // map graph values
-    int index;
-    long child_size;
-    Arc *parents;       // list of parent arcs
-    Arc *children;      // list of child arcs
-    int cyc_num;
-    struct _hobject *cyc_head, *cyc_next;
-#define MG_DFN_NAN  0
-#define MG_DFN_BUSY -1
-    int top_order;
-    char print_flag;
 };
 typedef struct _hobject hobject;
 
@@ -102,8 +93,21 @@ struct _cinfo {         // Class Info
     hobject *statics;
     finfo *fields;              // this class's fields, self
     finfo **values;             // this class's value fields, self + super(s)
+                        // map graph values
+    int index;
+    unsigned long size, child_size;
+    Arc *parents;       // list of parent arcs
+    Arc *children;      // list of child arcs
+    int cyc_num;
+    struct _cinfo *cyc_head, *cyc_next;
+#define MG_DFN_NAN  0
+#define MG_DFN_BUSY -1
+    int top_order;
+    char print_flag;
 };
 typedef struct _cinfo cinfo;
+
+long fakeClass = 1000;
 
 int readVersion(FILE *fin);
 int readUint(FILE *fin, unsigned int *input);
@@ -112,10 +116,12 @@ long long readIdent(struct jdump *);
 struct jdump *readDump(char *findclass, char *dumpfile);
 void readHeap(struct jdump *, unsigned int hsize);
 char *hideSpecials(char *);
-void resolveInstance(struct jdump *jf, hobject *ho);
+unsigned long resolveInstance(struct jdump *jf, hobject *ho);
+unsigned long hashKey(char *key);
+cinfo * findClass(struct jdump *jf, char *cname);
 
-void arc_add(hobject *parent, hobject *child, long count);
-Arc * arc_lookup(hobject *parent, hobject *child);
+Arc * arc_lookup(struct jdump *jf, cinfo *parent, cinfo *child);
+void arc_add(struct jdump *jf, hobject *parent, hobject *child, long count);
 void mg_assemble(struct jdump *);
 
 int debug = 0;
@@ -141,8 +147,9 @@ main(int argc, char **argv)
     char *findclass = NULL;
     struct jdump *df, *bf;
 
-    while (-1 != (opt = getopt(argc, argv, "b:C:d"))) {
+    while (-1 != (opt = getopt(argc, argv, "ab:C:d"))) {
     switch (opt) {
+    case 'a': findclass = strdup("*"); break;
     case 'b': baseline = strdup(optarg); break;
     case 'd': debug++; break;
     case 'C': findclass = strdup(optarg); break;
@@ -418,8 +425,8 @@ makeObj(trbt_tree_t *tab, int ht, long long iid, long long cid)
     ho->instId = iid;
     ho->fpos = 0;
     ho->resolved = ho->visit = 0;
-    ho->size = ho->child_size = 0;
-    ho->parents = ho->children = NULL;
+    ho->size = ho->csize = 0;
+    ho->xclassId = 0;
     return ho;
 }
 
@@ -632,15 +639,40 @@ readArray(struct jdump *jf, unsigned hsize, int prim)
         }
     }
     if (0x00 != primSig) {
+        cinfo *ci;
+        char *cname = talloc_zero_array(jf->sbTable, char, 3);
+        cname[0] = '['; 
+        cname[1] = primSig;
+
+        if (NULL == (ci = findClass(jf, cname))) {
+            ci = mkcinfo(jf->cTable, fakeClass++, elemClassId, cname);
+            trbt_insert32(jf->sbTable, (long) elemClassId, cname);
+            trbt_insert32(jf->cTable, fakeClass, ci);
+            trbt_insert32(jf->rcTable, hashKey(cname), ci);
+        }
+
         hsize -= elsz * isz;
-        ho = makeObj(jf->hTable, H_VARRAY, ide, elemClassId);
+        ho = makeObj(jf->hTable, H_VARRAY, ide, ci->ident);
         ho->fpos = ftello(jf->fin);
         ho->size = elsz;
         ho->count = isz;
         fseek(jf->fin, elsz * isz, SEEK_CUR);
     } else {
+        cinfo *ci;
+        char *cname; 
+        ci = (cinfo *) trbt_lookup32(jf->cTable, elemClassId);
+        cname = talloc_zero_array(jf->sbTable, char, 2 + strlen(ci->name));
+        // *cname = '[';
+        strcat(cname, ci->name);
+        if (NULL == (ci = findClass(jf, cname))) {
+            ci = mkcinfo(jf->cTable, fakeClass++, elemClassId, cname);
+            trbt_insert32(jf->sbTable, (long) elemClassId, cname);
+            trbt_insert32(jf->cTable, fakeClass, ci);
+            trbt_insert32(jf->rcTable, hashKey(cname), ci);
+        }
+
         hsize -= jf->identsz * isz;
-        ho = makeObj(jf->hTable, H_OARRAY, ide, elemClassId);
+        ho = makeObj(jf->hTable, H_OARRAY, ide, ci->ident);
         ho->fpos = ftello(jf->fin);
         ho->size = jf->identsz;
         ho->count = isz;
@@ -797,6 +829,7 @@ resolveClassNode(struct jdump *jf, cinfo *ci)
             case 'J':  index += 8; break;
             }
         }
+        ci->size = index;
     }
     ci->resolved = 1;
 }
@@ -831,49 +864,73 @@ resolveClasses(struct jdump *jf)
     resolveInstances(jf, jf->hTable->root);
 }
 
-void
+unsigned long
 resolveInstance(struct jdump *jf, hobject *ho)
 {
     cinfo *ci;
+    unsigned long size = 0;
     int i;
 
     if (ho->resolved)
-        return;
+        return ho->osize + ho->csize;
     ho->resolved = 1;
+
+    ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
 
     if (H_VARRAY == ho->htype) {
         ho->hvalues = talloc_array(ho, union hvalue, ho->count);
         if (0 == ho->count)
-            return;
+            return 0;
         fseeko(jf->fin, ho->fpos, SEEK_SET);
-        switch (ho->classId) {
+        if (12 < ho->classId) {
+            switch (*(ci->name + 1)) {
+            case 'B':  ho->xclassId = 8;  break;
+            case 'Z':  ho->xclassId = 8;  break;
+            case 'C':  ho->xclassId = 9;  break;
+            case 'S':  ho->xclassId = 9;  break;
+            case 'F':  ho->xclassId = 6;  break;
+            case 'D':  ho->xclassId = 7;  break;
+            case 'I':  ho->xclassId = 10; break;
+            case 'J':  ho->xclassId = 11; break;
+            }
+        }
+        switch (ho->xclassId ? ho->xclassId : ho->classId) {
         case 4: case 8: { // BOOLEAN, BYTE
             char *b = (char *) ho->hvalues;
             fread(b, sizeof(char), ho->count, jf->fin);
+            size = ho->count;
             break;
         }
         case 5: case 9: {       // CHAR, SHORT
             unsigned short *c = (unsigned short *) ho->hvalues;
             fread(c, sizeof(unsigned short), ho->count, jf->fin);
+            size = 2 * ho->count;
             break;
         }
-        case 6: case 7:         // FLOAT, DOUBLE
+        case 6:                 // FLOAT
+            size = 4 * ho->count;
+            break;
+        case 7:                 // DOUBLE
+            size = 8 * ho->count;
             break;
         case 10: {              // INT
             unsigned int *i = (unsigned int *) ho->hvalues;
             fread(i, sizeof(unsigned int), ho->count, jf->fin);
+            size = 4 * ho->count;
             break;
         }
         case 11: {              // LONG
             unsigned long long *j = (unsigned long long *) ho->hvalues;
             fread(j, sizeof(unsigned long long), ho->count, jf->fin);
+            size = 8 * ho->count;
             break;
         }
         }
-        return;
+        ho->osize = ci->size = size;
+        return ho->osize;
     } else if (H_OARRAY == ho->htype) {
         if (0 == ho->count)
-            return;
+            return 0;
         fseeko(jf->fin, ho->fpos, SEEK_SET);
         ho->hvalues = talloc_array(ho, union hvalue, ho->count);
         for (i = 0; i < ho->count; i++) 
@@ -881,15 +938,14 @@ resolveInstance(struct jdump *jf, hobject *ho)
         for (i = 0; i < ho->count; i++) {
             hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (ho->hvalues + i)->ident);
             if (dref) {
-                arc_add(ho, dref, 1);
-                resolveInstance(jf, dref);
+                ho->csize += resolveInstance(jf, dref);
+                arc_add(jf, ho, dref, 1);
             }
         }
-        return;
+        ho->osize = ci->size = ho->count * jf->identsz;
+        return ho->osize + ho->csize;
     }
     
-    ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
-
     if (ci->tfields)
         ho->hvalues = talloc_array(ho, union hvalue, ci->tfields);
     for (i = 0; i < ci->tfields; i++) {
@@ -900,27 +956,29 @@ resolveInstance(struct jdump *jf, hobject *ho)
         switch (info->ftype) {
         case '[': 
         case 'L': {
-            ho->size += jf->identsz;
+            size += jf->identsz;
             value->ident = readIdent(jf);
             hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident);
             if (0 && !dref) 
                 fprintf(stderr, "resolveInstance: cannot resolve Instance 0x%08x in 0x%08x of 0x%08x %s\n",
                     value->ident, ho->instId, ho->classId, ci->name);
             if (dref) {
-                arc_add(ho, dref, 1);
-                resolveInstance(jf, dref);
+                ho->csize += resolveInstance(jf, dref);
+                arc_add(jf, ho, dref, 1);
             }
             break;
         }
         case 'Z' : case 'B':
-            ho->size += 1;
+            size += 1;
             value->b = getc(jf->fin); break;
         case 'S' :
-        case 'C' : ho->size += 2;  readUshort(jf->fin, &(value->c)); break;
-        case 'I' : ho->size += 4;  readUint(jf->fin, &(value->i)); break;
-        case 'J' : ho->size += 8;  readUlong(jf->fin, &(value->j)); break;
+        case 'C' : size += 2;  readUshort(jf->fin, &(value->c)); break;
+        case 'I' : size += 4;  readUint(jf->fin, &(value->i)); break;
+        case 'J' : size += 8;  readUlong(jf->fin, &(value->j)); break;
         }
     }
+    ho->osize = ci->size = size;
+    return ho->osize + ho->csize;
 }
 
 void
@@ -930,15 +988,18 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
     cinfo *ci;
 
     if (ho->visit) {
-        printf("[ recursive ] Instance 0x%08x of 0x%08x\n", ho->instId, ho->classId);
+        printf("[ recursive ] Instance 0x%08x of 0x%08x self %d self+children %d\n",
+            ho->instId, ho->classId, ho->osize, ho->osize + ho->csize);
         return;
     }
     if (H_VARRAY == ho->htype) {
-        printf("value array 0x%08x 0x%08x count %d\n", ho->instId, ho->classId, ho->count);
+        int def = 0;
+        printf("value array 0x%08x 0x%08x count %d size %d\n",
+            ho->instId, ho->classId, ho->count, ho->osize);
         if (ho->count) {
         if (indent) fputs("\t\t", stdout);
         for (i = 0; i < ho->count; i++) {
-            switch (ho->classId) {
+            switch (ho->xclassId ? ho->xclassId : ho->classId) {
             case 4: case 8: {
                 char *b = (char *) ho->hvalues;
                 printf("%x ", *(b + i)); break; }
@@ -956,37 +1017,59 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
                 printf("%lx ", *(j + i)); break; }
             }
         }
-        puts("");
         }
+        if (!def) puts("");
         return;
     } else if (H_OARRAY == ho->htype) {
-        printf("object array 0x%08x 0x%08x count %d\n", ho->instId, ho->classId, ho->count);
+        int last_cnt = 0;
+        unsigned long long last_pid = ~0;
+        unsigned long long *pid = (unsigned long long *) ho->hvalues;
+        hobject *dref;
+        printf("object array 0x%08x 0x%08x count %d size %d\n",
+            ho->instId, ho->classId, ho->count, ho->osize);
         if (ho->count) {
         for (i = 0; i < ho->count; i++) {
-            if (indent) fputs("\t\t\t", stdout);
-            if (5 < i) {
+            if (pshort && 0 == *(pid + i))
+                continue;
+            if (0 && pshort && 5 < i) {
+                if (0 != last_cnt)
+                    printf(" [ %d elements ]\n", last_cnt);
+                last_cnt = 0;
+                if (indent) fputs("\t\t\t", stdout);
                 puts("[....]");
                 break;
             }
-            unsigned long long *pid = (unsigned long long *) ho->hvalues;
-            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) *(pid + i));
-            if (dref)
+            if (*(pid + i) && (dref = (hobject *) trbt_lookup32(jf->hTable, (long) *(pid + i)))) {
+                if (0 != last_cnt)
+                    printf(" [ %d elements ]\n", last_cnt);
+                last_cnt = 0;
                 printInstance(jf, dref, 1 + indent, 1);
-            else
-                printf("Instance 0x%08x of 0x%08x %s\n", *(pid + i), 0, "unknown");
+            } else if (last_pid != *(pid + i)) {
+                if (0 != last_cnt)
+                    printf(" [ %d elements ]\n", last_cnt);
+                if (indent) fputs("\t\t\t", stdout);
+                if (0 == *(pid + i))
+                    printf("[null]");
+                else 
+                    printf("Instance 0x%08x of 0x%08x %s", *(pid + i), 0, "unknown");
+                last_cnt = 1;
+                last_pid = *(pid + i);
+            } else
+                last_cnt++;
         }
+        if (0 != last_cnt)
+            printf(" [ %d elements ]\n", last_cnt);
         }
         return;
     }
 
     ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
-    ho->visit = 1;
     // if (indent) fputs("\t\t", stdout);
-    printf("Instance 0x%08x of 0x%08x %s\n", ho->instId, ho->classId, ci->name);
-    if (pshort) {
-        ho->visit = 0;
+    printf("Instance 0x%08x of 0x%08x %s self %d self+children %d\n",
+        ho->instId, ho->classId, ci->name, ho->osize, ho->osize + ho->csize);
+    if (pshort)
         return;
-    }
+    ho->visit = 1;
     if (indent)
         printf("\t\t----> (%d)\n", indent);
     for (i = 0; i < ci->tfields; i++) {
@@ -998,10 +1081,12 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
         switch (info->ftype) {
         case '[' :
         case 'L' : {
-            hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident);
-            if (dref) {
+            hobject *dref;
+            if (value->ident && (dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident)))
                 printInstance(jf, dref, 1 + indent, 1);
-            } else
+            else if (0 == value->ident)
+                puts("[null]");
+            else
                 printf("Instance 0x%08x of 0x%08x %s\n", value->ident, 0, "unknown");
             break;
         }
@@ -1018,8 +1103,10 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
         printf("\t\t<---- (%d)\n", indent);
     fflush(stdout);
 
+    if (0)
     for (i = 0; i < ci->tfields; i++) {
         finfo *info = *(ci->values + i);
+        printf(" [%3d:%3d:0x%08x ] ", i, info->offset, ho->instId);
         union hvalue *value = ho->hvalues + i;
         switch (info->ftype) {
         case '[' :
@@ -1032,8 +1119,20 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
         default:  break;
         }
     }
-        
-    ho->visit = 0;
+
+    return;
+}
+
+void 
+printInstances(struct jdump *jf, trbt_node_t *node)
+{
+    if (NULL == node)
+        return;
+    printInstances(jf, node->left);
+    printf("begin node %x\n", node->data);
+    printInstance(jf, (hobject *) node->data, 0, 0);
+    printf("end node %x\n\n", node->data);
+    printInstances(jf, node->right);
 }
 
 void
@@ -1092,7 +1191,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &stackSeq);
             hsize -= jf->identsz + 8;
             if (debug)
-            printf("0x%08lx root thread obj 0x08x 0x08x\n", id, threadSeq, stackSeq);
+            printf("0x%08lx root thread obj 0x%08x 0x%08x\n", id, threadSeq, stackSeq);
             // putchar('r');
             roott++;
             break;
@@ -1258,20 +1357,26 @@ readHeap(struct jdump *jf, unsigned int hsize)
     if (jf->fclass) {
         // cinfo *cdata = findClass(jf, "com/teramedica/web/actions/notification/TMNotificationListAction");
         // cinfo *cdata = findClass(jf, "java/util/concurrent/ConcurrentHashMap$Segment");
-        cinfo *cdata = findClass(jf, jf->fclass);
-        if (cdata)
-            collectStats(jf, jf->hTable->root, (long) cdata->ident);
-        else 
-            printf("findclass: \'%s\' not found\n");
+        if ('*' == jf->fclass[0]) {
+            resolveInstances(jf, jf->hTable->root);
+            printInstances(jf, jf->hTable->root);
+        } else {
+            cinfo *cdata = findClass(jf, jf->fclass);
+            if (cdata)
+                collectStats(jf, jf->hTable->root, (long) cdata->ident);
+            else 
+                printf("findclass: \'%s\' not found\n", jf->fclass);
+        }
     }
 
-    mg_assemble(jf);
+    // mg_assemble(jf);
 }
 
 Arc *
-arc_lookup(hobject *parent, hobject *child)
+arc_lookup(struct jdump *jf, cinfo *parent, cinfo *child)
 {
     Arc * arc;
+
     if (!parent || !child) {
         puts("[arc_lookup] parent || child is NULL");
         return NULL;
@@ -1285,13 +1390,18 @@ arc_lookup(hobject *parent, hobject *child)
 }
 
 void
-arc_add(hobject *parent, hobject *child, long count)
+arc_add(struct jdump *jf, hobject *hop, hobject *hoc, long count)
 {
     Arc * arc;
+    cinfo *parent, *child;
 
-    arc = arc_lookup(parent, child);
+    parent = (cinfo *) trbt_lookup32(jf->cTable, (long) hop->classId);
+    child  = (cinfo *) trbt_lookup32(jf->cTable, (long) hoc->classId);
+
+    arc = arc_lookup(jf, parent, child);
     if (arc) {
         arc->count += count;
+        arc->child_size += hoc->size;
         return;
     }
 
@@ -1299,6 +1409,7 @@ arc_add(hobject *parent, hobject *child, long count)
     arc->parent = parent;
     arc->child = child;
     arc->count = count;
+    arc->child_size = hoc->size;
 
     if (parent != child) {
         if (arcs_num == arcs_max) {
@@ -1320,23 +1431,24 @@ arc_add(hobject *parent, hobject *child, long count)
 }
 
 void
-arc_init(hobject *ho)
+arc_init(cinfo *ci)
 {
-    ho->child_size = ho->print_flag = 0;
-    ho->top_order = MG_DFN_NAN;
-    ho->cyc_num = 0;
-    ho->cyc_head = ho;
-    ho->cyc_next = NULL;
+    ci->child_size = ci->print_flag = 0;
+    ci->top_order = MG_DFN_NAN;
+    ci->cyc_num = 0;
+    ci->cyc_head = ci;
+    ci->cyc_next = NULL;
+    ci->parents = ci->children = NULL;
 }
 
 struct _dfstack {
-    hobject *obj;
+    cinfo *obj;
     int cyctop;
 };
 typedef struct _dfstack dfstack;
 
 int dfn_depth = 0, dfn_maxdepth = 0, dfn_counter = MG_DFN_NAN;
-dfstack *dfn_stack;
+dfstack *dfn_stack = NULL;
 
 trbt_tree_t *cyctab, *topotab, *sizetab;
 int num_cycles = 0, num_objs;
@@ -1344,12 +1456,12 @@ int num_cycles = 0, num_objs;
 struct jdump *gtab;
 
 void
-mg_previsit(hobject *ho)
+mg_previsit(cinfo *ho)
 {
     ++dfn_depth;
 
     if (dfn_depth >= dfn_maxdepth) {
-        dfn_maxdepth++;
+        dfn_maxdepth += 16;
         dfn_stack = (dfstack *) talloc_realloc(NULL, dfn_stack, dfstack, dfn_maxdepth);
     }
     dfn_stack[dfn_depth].obj = ho;
@@ -1358,9 +1470,9 @@ mg_previsit(hobject *ho)
 }
 
 void
-mg_postvisit(hobject *ho)
+mg_postvisit(cinfo *ho)
 {
-    hobject *memb;
+    cinfo *memb;
 
     if (ho->cyc_head == ho) {
         ++dfn_counter;
@@ -1372,9 +1484,9 @@ mg_postvisit(hobject *ho)
 }
 
 void
-find_cycle(hobject *ho)
+find_cycle(cinfo *ho)
 {
-    hobject *head = NULL;
+    cinfo *head = NULL;
     int cycle_top;
 
     for (cycle_top = dfn_depth;  cycle_top > 0;  --cycle_top) {
@@ -1389,7 +1501,7 @@ find_cycle(hobject *ho)
     }
 
     if (cycle_top != dfn_depth) {
-        hobject *tail;
+        cinfo *tail;
         int index;
         for (tail = head;  tail->cyc_next;  tail = tail->cyc_next)      // find tail
             ;
@@ -1414,7 +1526,7 @@ find_cycle(hobject *ho)
 #define IS_BUSY(x)      MG_DFN_NAN != (x)->top_order
 
 void
-mg_dfn(hobject *ho)
+mg_dfn(cinfo *ho)
 {
     Arc *arc;
 
@@ -1432,17 +1544,26 @@ mg_dfn(hobject *ho)
 }
 
 void
-cyc_iter(hobject *ho)
+cyc_iter(cinfo *ci, struct jdump *jf)
 {
-    hobject *cycobj, *memb;
-    if (!(ho->cyc_head == ho && ho->cyc_next))
+    cinfo *cycobj, *memb, *nci;
+    char *cname;
+    static int elemClassId = 16;
+
+    if (!(ci->cyc_head == ci && ci->cyc_next))
         return;
-    cycobj = makeObj(cyctab, H_CYCLE, 0, 0);
-    cycobj->top_order = MG_DFN_NAN;
-    cycobj->cyc_num = ++num_cycles;
-    cycobj->cyc_head = cycobj;
-    cycobj->cyc_next = ho;
-    for (memb = ho;  memb;  memb->cyc_next) {
+
+    cname = talloc_zero_array(gtab->sbTable, char, 20);
+    sprintf(cname, "<Cycle %d>", ++num_cycles);
+    nci = mkcinfo(jf->cTable, fakeClass++, elemClassId, cname);
+    trbt_insert32(jf->cTable, fakeClass, nci);
+    trbt_insert32(jf->rcTable, hashKey(cname), nci);
+
+    nci->top_order = MG_DFN_NAN;
+    nci->cyc_num = num_cycles;
+    nci->cyc_head = cycobj;
+    nci->cyc_next = ci;
+    for (memb = ci;  memb;  memb->cyc_next) {
         memb->cyc_num = num_cycles;
         memb->cyc_head = cycobj;
     }
@@ -1450,25 +1571,25 @@ cyc_iter(hobject *ho)
 }
 
 void
-topo_sort(hobject *ho)
+topo_sort(cinfo *ci)
 {
-    trbt_insert32(topotab, ho->top_order, ho);
+    trbt_insert32(topotab, ci->top_order, ci);
 }
 
 void
-size_sort(hobject *ho)
+size_sort(cinfo *ci)
 {
-    trbt_insert32(sizetab, ho->size + ho->child_size, ho);
+    trbt_insert32(sizetab, ci->size + ci->child_size, ci);
 }
 
-hobject *old_head = NULL;
+cinfo *old_head = NULL;
 long print_size = 0;
 
 void
-prop_flags(hobject *ho)
+prop_flags(cinfo *ho)
 {
     if (ho->cyc_head != old_head) {
-        hobject *head;
+        cinfo *head;
 
         head = old_head = ho->cyc_head;
         head = ho->cyc_head;
@@ -1482,7 +1603,7 @@ prop_flags(hobject *ho)
             }
         } else {
             Arc *arc;
-            hobject *memb;
+            cinfo *memb;
             head->print_flag = 0;
             for (memb = head->cyc_next;  memb;  memb = memb->cyc_next)
             for (arc = memb->parents;  arc;  arc = arc->next_parent) {
@@ -1500,14 +1621,14 @@ prop_flags(hobject *ho)
 }
 
 void
-prop_size(hobject *ho)
+prop_size(cinfo *ho)
 {
     Arc *arc;
     if (0 == ho->size)
         return;
 
     for (arc = ho->children;  arc;  arc = arc->next_child) {
-        hobject *child = arc->child;
+        cinfo *child = arc->child;
         if (arc->count == 0 || arc->child == ho)
             continue;
         if (arc->child->cyc_head != arc->child)  {
@@ -1532,13 +1653,13 @@ prop_size(hobject *ho)
 }
 
 void
-arc_iter(void (*func)(), trbt_node_t *cnode)
+arc_iter(void (*func)(), trbt_node_t *cnode, struct jdump *jf)
 {
     if (NULL == cnode)
         return;
-    arc_iter(func, cnode->left);
-    (*func)((hobject *) cnode->data);
-    arc_iter(func, cnode->right);
+    arc_iter(func, cnode->left, jf);
+    (*func)((cinfo *) cnode->data, jf);
+    arc_iter(func, cnode->right, jf);
 }
 
 void
@@ -1546,22 +1667,22 @@ arc_rev_iter(void (*func)(), trbt_node_t *cnode)
 {
     if (NULL == cnode)
         return;
-    arc_iter(func, cnode->right);
-    (*func)((hobject *) cnode->data);
-    arc_iter(func, cnode->left);
+    arc_iter(func, cnode->right, NULL);
+    (*func)((cinfo *) cnode->data);
+    arc_iter(func, cnode->left, NULL);
 }
 
 void
 cycle_link(struct jdump *jf)
 {
     num_cycles = 0;
-    arc_iter(&cyc_iter, jf->hTable->root);
+    arc_iter(&cyc_iter, jf->hTable->root, jf);
 }
 
 void
-cycle_size(hobject *ho)
+cycle_size(cinfo *ho)
 {
-    hobject *memb;              // size of the cycle is the size of all of it's members
+    cinfo *memb;              // size of the cycle is the size of all of it's members
 
     for (memb = ho->cyc_next;  memb;  memb = memb->cyc_next)
         ho->size += memb->size;
@@ -1590,7 +1711,7 @@ cmp_arc(Arc *left, Arc *right)
 }
 
 void
-sort_parents(hobject *ho)
+sort_parents(cinfo *ho)
 {
     Arc *arc, *detached, sorted, *prev;
 
@@ -1607,7 +1728,7 @@ sort_parents(hobject *ho)
 }
 
 void
-sort_children(hobject *ho)
+sort_children(cinfo *ho)
 {
     Arc *arc, *detached, sorted, *prev;
 
@@ -1624,22 +1745,25 @@ sort_children(hobject *ho)
 }
 
 void
-print_name(hobject *ho)
+print_name(cinfo *ci)
 {
+#ifdef notdef
     if (H_CYCLE == ho->htype) {
         printf("Cycle <%d>\n", ho->cyc_num);
         return;
     }
 
-    cinfo *ci = (cinfo *) trbt_lookup32(gtab->cTable, ho->classId);
+    cinfo *ci = (cinfo *) trbt_lookup32(gtab->cTable, ho->ident);
     if (ci)
         printf ("%s\n", ci->name);
     else
-        printf ("[%d] Unknown\n", ho->classId);
+        printf ("[%d] Unknown\n", ho->ident);
+#endif
+    printf (" %s\n", ci->name);
 }
 
 void
-print_parents(hobject *ho)
+print_parents(cinfo *ho)
 {
     Arc *arc;
     if (!ho->parents)
@@ -1657,7 +1781,7 @@ print_parents(hobject *ho)
 }
 
 void
-print_children(hobject *ho)
+print_children(cinfo *ho)
 {
     Arc *arc;
     if (!ho->children)
@@ -1675,46 +1799,45 @@ print_children(hobject *ho)
 }
 
 void
-mg_print(hobject *ho)
+mg_print(cinfo *ho)
 {
     char buf[20];
     ho->index = num_objs++;
     sprintf(buf, "[%d]", ho->index);
 
-    if (H_CYCLE == ho->htype) {
-    } else {
+    // if (H_CYCLE == ho->htype) {
+    // } else {
         print_parents(ho);
         printf("%-6.6s %5.1f %7.2f %7.2f",
             buf, 100 * (ho->size + ho->child_size) / print_size, ho->size, ho->child_size);
         print_name(ho);
         print_children(ho);
-    }
+    // }
 }
 
 void 
 mg_assemble(struct jdump *jf)
 {
-    arc_iter(&arc_init, jf->hTable->root);              // initialize
-    arc_iter(&mg_dfn, jf->hTable->root);                // depth first numbering
+    arc_iter(&arc_init, jf->cTable->root, NULL);              // initialize
+    arc_iter(&mg_dfn, jf->cTable->root, NULL);                // depth first numbering
 
     cyctab = trbt_create(NULL, 0);
 
     cycle_link(jf);                                     // link nodes on the same cycle
 
     topotab = trbt_create(NULL, 0);
-    arc_iter(&topo_sort, jf->hTable->root);             // topo sort the objs
+    arc_iter(&topo_sort, jf->cTable->root, NULL);             // topo sort the objs
     arc_rev_iter(&prop_flags, topotab->root);           // prop flags to children
 
-    arc_iter(&cycle_size, cyctab->root);
+    arc_iter(&cycle_size, cyctab->root, NULL);
 
-    arc_iter(&prop_size, topotab->root);                // prop size to children
+    arc_iter(&prop_size, topotab->root, NULL);                // prop size to children
     talloc_free(topotab);
 
     sizetab = trbt_create(NULL, 0);                     // size sort regular objs and the cycles
-    arc_iter(&size_sort, jf->hTable->root);
-    arc_iter(&size_sort, cyctab->root);
+    arc_iter(&size_sort, jf->cTable->root, NULL);
+    arc_iter(&size_sort, cyctab->root, NULL);
     talloc_free(cyctab);
 
-    gtab = jf;
-    arc_iter(&mg_print, sizetab->root);
+    arc_iter(&mg_print, sizetab->root, NULL);
 }
