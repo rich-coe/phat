@@ -19,11 +19,12 @@ struct jdump {          // java dump
     FILE *fin;
     int fVersion;
     unsigned int identsz;
-    trbt_tree_t *sbTable,               // string const table
+    trbt_tree_t *sbTable,       // string const table
         *cTable,                // class table, by ident
         *hTable,                // object table
         *rsbTable,              // revers string table, by name
-        *rcTable;               // reverse class table, by name
+        *rcTable,               // reverse class table, by name
+        *roots;                 // root objects
     struct _cinfo *javaLangClass, *javaLangString, *javaLangClassLoader;
     char *fclass;
 };
@@ -228,6 +229,7 @@ readDump(char *fclass, char *dumpfile)
     df->cTable = trbt_create(NULL, 0);     // table of classes
     df->rcTable = trbt_create(NULL, 0);    // reverse lookup of cTable
     df->hTable = trbt_create(NULL, 0);     // table of heap objs
+    df->roots = trbt_create(NULL, 0);           // table of root ids
 
     while (EOF != (rtype = getc(df->fin))) {
         unsigned int rlen, ts, pos;
@@ -1176,6 +1178,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
     jf->javaLangString = findClass(jf, "java/lang/String");
 
     while (0 < hsize && EOF != (rtype = getc(jf->fin))) {
+        long long *iptr;
         hsize--;
         switch (rtype) {
         case 0xff : {    // HPROF_GC_ROOT_UNKNOWN
@@ -1192,6 +1195,9 @@ readHeap(struct jdump *jf, unsigned int hsize)
             hsize -= jf->identsz + 8;
             if (debug)
             printf("0x%08lx root thread obj 0x%08x 0x%08x\n", id, threadSeq, stackSeq);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // putchar('r');
             roott++;
             break;
@@ -1202,7 +1208,10 @@ readHeap(struct jdump *jf, unsigned int hsize)
             gid = readIdent(jf);
             hsize -= jf->identsz + jf->identsz;
             if (debug)
-            printf("0x%08lx root native static \n", id);
+                printf("0x%08lx root native static 0x%08lx\n", id, gid);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // puts("\t heap root native global");
             // putchar('G');
             rootg++;
@@ -1216,7 +1225,10 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &depth);
             hsize -= jf->identsz + 8;
             if (debug)
-            printf("0x%08lx root native local \n", id);
+                printf("0x%08lx root native local \n", id);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // puts("\t heap root native local");
             // putchar('L');
             rootl++;
@@ -1230,7 +1242,11 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &depth);
             hsize -= jf->identsz + 8;
             if (debug)
-            printf("0x%08lx root java local \n", id);
+                printf("0x%08lx root java local \n", id);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
+            // puts("\t heap root native local");
             // puts("\t heap root java frame");
             // putchar('F');
             frame++;
@@ -1243,7 +1259,10 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &threadSeq);
             hsize -= jf->identsz + 4;
             if (debug)
-            printf("0x%08lx root native stack \n", id);
+                printf("0x%08lx root native stack \n", id);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // puts("\t heap root native stack");
             // putchar('S');
             stack++;
@@ -1253,7 +1272,10 @@ readHeap(struct jdump *jf, unsigned int hsize)
             long long id = readIdent(jf);
             hsize -= jf->identsz;
             if (debug)
-            printf("0x%08lx root system class\n", id);
+                printf("0x%08lx root system class\n", id);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // puts("\t heap root system class");
             // putchar('C');
             sclass++;
@@ -1266,7 +1288,10 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &threadSeq);
             hsize -= jf->identsz + 4;
             if (debug)
-            printf("0x%08lx root thread block\n", id);
+                printf("0x%08lx root thread block\n", id);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // puts("\t heap root thread block");
             // putchar('T');
             tblock++;
@@ -1276,7 +1301,10 @@ readHeap(struct jdump *jf, unsigned int hsize)
             long long id = readIdent(jf);
             hsize -= jf->identsz;
             if (debug)
-            printf("0x%08lx root busy monitor\n", id);
+                printf("0x%08lx root busy monitor\n", id);
+            iptr = (int *) talloc(jf->roots, long long);
+            *iptr = id;
+            trbt_insert32(jf->roots, (long) id, iptr);
             // puts("\t heap root monitor ");
             // putchar('M');
             monitor++;
@@ -1369,7 +1397,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
         }
     }
 
-    // mg_assemble(jf);
+    mg_assemble(jf);
 }
 
 Arc *
@@ -1541,6 +1569,27 @@ mg_dfn(cinfo *ho)
         mg_dfn(arc->child);
     }
     mg_postvisit(ho);
+}
+
+void
+mg_dfn_lup(long long *idp, struct jdump *jf)
+{
+    hobject *ho = (hobject *) trbt_lookup32(jf->hTable, (long) *idp);
+    cinfo *ci;
+
+    if (NULL == ho) {
+        printf("WARNING: mg_dfn_lup: invalid root lookup 0x%08x\n", *idp);
+        return;
+    }
+
+    ci = (cinfo *) trbt_lookup32(jf->cTable, (long) ho->classId);
+
+    if (NULL == ci) {
+        printf("WARNING: mg_dfn_lup: invalid ident lookup 0x%08x\n", *idp, ho->classId);
+        return;
+    }
+
+    mg_dfn(ci);
 }
 
 void
@@ -1819,14 +1868,14 @@ void
 mg_assemble(struct jdump *jf)
 {
     arc_iter(&arc_init, jf->cTable->root, NULL);              // initialize
-    arc_iter(&mg_dfn, jf->cTable->root, NULL);                // depth first numbering
+    arc_iter(&mg_dfn_lup, jf->roots->root, jf);               // depth first numbering
 
     cyctab = trbt_create(NULL, 0);
 
     cycle_link(jf);                                     // link nodes on the same cycle
 
     topotab = trbt_create(NULL, 0);
-    arc_iter(&topo_sort, jf->cTable->root, NULL);             // topo sort the objs
+    arc_iter(&topo_sort, jf->roots->root, NULL);             // topo sort the objs
     arc_rev_iter(&prop_flags, topotab->root);           // prop flags to children
 
     arc_iter(&cycle_size, cyctab->root, NULL);
@@ -1835,7 +1884,7 @@ mg_assemble(struct jdump *jf)
     talloc_free(topotab);
 
     sizetab = trbt_create(NULL, 0);                     // size sort regular objs and the cycles
-    arc_iter(&size_sort, jf->cTable->root, NULL);
+    arc_iter(&size_sort, jf->roots->root, NULL);
     arc_iter(&size_sort, cyctab->root, NULL);
     talloc_free(cyctab);
 
