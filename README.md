@@ -50,14 +50,14 @@ tracebacks for each thread
 - count of instances
 - symbol class name
 
-0x2678c7a8 class 0x530fc950 3 java/util/concurrent/atomic/AtomicLongFieldUpdater$CASUpdater
-0x2678c808 class 0x54196eb0 0 java/util/concurrent/ExecutionException
-0x2678c928 class 0x5634e890 0 java/util/UUID$Holder
-0x2678ca48 class 0x541c2860 0 java/util/JumboEnumSet
-0x2678d8e8 class 0x53129728 2 java/util/Collections$SynchronizedSortedMap
-0x2678df48 class 0x54d8b8e8 3 java/util/TaskQueue
-0x2678dfa8 class 0x54d86258 0 java/util/TooManyListenersException
-0x26993e50 class 0x55583a20 3 java/util/Timer
+    0x2678c7a8 class 0x530fc950 3 java/util/concurrent/atomic/AtomicLongFieldUpdater$CASUpdater
+    0x2678c808 class 0x54196eb0 0 java/util/concurrent/ExecutionException
+    0x2678c928 class 0x5634e890 0 java/util/UUID$Holder
+    0x2678ca48 class 0x541c2860 0 java/util/JumboEnumSet
+    0x2678d8e8 class 0x53129728 2 java/util/Collections$SynchronizedSortedMap
+    0x2678df48 class 0x54d8b8e8 3 java/util/TaskQueue
+    0x2678dfa8 class 0x54d86258 0 java/util/TooManyListenersException
+    0x26993e50 class 0x55583a20 3 java/util/Timer
 
 
 ### Instance Summary
@@ -98,10 +98,12 @@ tracebacks for each thread
 ## Usage 
 
 - Generate a class instance list with counts
+
     phat  heapdump.heap  > heapdump.out
     egrep ' class ' heapdump.out | sort -n -k 4 > heapdump.out.s
 
 - Dump details on a specific class
+
     phat  -C java/util/TaskQueue  heapdump.heap  > heapinfo
 
 
