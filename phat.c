@@ -24,9 +24,11 @@ struct jdump {          // java dump
         *hTable,                // object table
         *rsbTable,              // revers string table, by name
         *rcTable,               // reverse class table, by name
+        *scTable,               // class table, by serial
         *roots;                 // root objects
     struct _cinfo *javaLangClass, *javaLangString, *javaLangClassLoader;
     char *fclass;
+    int plimit;
 };
 
 struct _arc {
@@ -108,18 +110,33 @@ struct _cinfo {         // Class Info
 };
 typedef struct _cinfo cinfo;
 
+struct _rinfo {
+    long long ident;
+    long long ref;
+    int rtype;
+#define  ROOT_NATIVE_STATIC  0x1
+#define  ROOT_NATIVE_LOCAL   0x2
+#define  ROOT_JAVA_LOCAL     0x3
+#define  ROOT_NATIVE_STACK   0x4
+#define  ROOT_SYSTEM_CLASS   0x5
+#define  ROOT_THREAD_BLOCK   0x6
+    char *desc;
+};
+typedef struct _rinfo rinfo;
+
 long fakeClass = 1000;
 
 int readVersion(FILE *fin);
 int readUint(FILE *fin, unsigned int *input);
 int readUlong(FILE *fin, unsigned long long *input);
 long long readIdent(struct jdump *);
-struct jdump *readDump(char *findclass, char *dumpfile);
+struct jdump *readDump(char *findclass, int limit, char *dumpfile);
 void readHeap(struct jdump *, unsigned int hsize);
 char *hideSpecials(char *);
 unsigned long resolveInstance(struct jdump *jf, hobject *ho);
 unsigned long hashKey(char *key);
 cinfo * findClass(struct jdump *jf, char *cname);
+void printString(struct jdump *jf, hobject *ho);
 
 Arc * arc_lookup(struct jdump *jf, cinfo *parent, cinfo *child);
 void arc_add(struct jdump *jf, hobject *parent, hobject *child, long count);
@@ -128,6 +145,17 @@ void mg_assemble(struct jdump *);
 int debug = 0;
 
 extern int optind;
+
+rinfo *
+mkrinfo(trbt_tree_t *tab, long long rid, long long refid, int rtype, char *desc)
+{
+    rinfo *ri = (rinfo *) talloc(tab, rinfo);
+    ri->ident = rid;
+    ri->ref = refid;
+    ri->rtype = rtype;
+    ri->desc = strdup(desc);
+    return ri;
+}
 
 cinfo *
 mkcinfo(trbt_tree_t *tab, long long cid, long long nid, char *name)
@@ -143,33 +171,34 @@ mkcinfo(trbt_tree_t *tab, long long cid, long long nid, char *name)
 int
 main(int argc, char **argv)
 {
-    int opt;
+    int opt, limit = 0;
     char *baseline = NULL;
     char *findclass = NULL;
     struct jdump *df, *bf;
 
-    while (-1 != (opt = getopt(argc, argv, "ab:C:d"))) {
+    while (-1 != (opt = getopt(argc, argv, "ab:C:dl:"))) {
     switch (opt) {
     case 'a': findclass = strdup("*"); break;
     case 'b': baseline = strdup(optarg); break;
     case 'd': debug++; break;
     case 'C': findclass = strdup(optarg); break;
+    case 'l': limit = atoi(optarg); break;
     default: 
         printf("opt %d\n");
         break;
     }
     }
 
-    df = readDump(findclass, argv[optind]);
+    df = readDump(findclass, limit, argv[optind]);
     if (baseline) {
-        bf = readDump(NULL, baseline);
+        bf = readDump(NULL, limit, baseline);
     }
 
     exit(0);
 }
 
 struct jdump *
-readDump(char *fclass, char *dumpfile) 
+readDump(char *fclass, int plimit, char *dumpfile) 
 {
     struct jdump *df;
     int rc;
@@ -182,6 +211,7 @@ readDump(char *fclass, char *dumpfile)
     df = (struct jdump *) malloc(sizeof(struct jdump));
 
     df->fclass = fclass;
+    df->plimit = plimit;
 
     if (NULL == (df->fin = fopen(dumpfile, "r"))) {
         fprintf(stderr, "cannot open '%s' for reading, errno %d\n", dumpfile, errno);
@@ -228,6 +258,7 @@ readDump(char *fclass, char *dumpfile)
     // df->rsbTable = trbt_create(NULL, 0);   // reverse lookup of sbTable
     df->cTable = trbt_create(NULL, 0);     // table of classes
     df->rcTable = trbt_create(NULL, 0);    // reverse lookup of cTable
+    df->scTable = trbt_create(NULL, 0);           // table of classes by serial
     df->hTable = trbt_create(NULL, 0);     // table of heap objs
     df->roots = trbt_create(NULL, 0);           // table of root ids
 
@@ -285,6 +316,7 @@ readDump(char *fclass, char *dumpfile)
             nkey = (long) classNameId;
             ci = mkcinfo(df->cTable, classId, classNameId, (char *) trbt_lookup32(df->sbTable, nkey));
             trbt_insert32(df->cTable, key, ci);
+            trbt_insert32(df->scTable, serial, ci);
             ckey = crc32(ckey, ci->name, strlen(ci->name));
             trbt_insert32(df->rcTable, ckey, ci);
             if (debug) {
@@ -295,22 +327,42 @@ readDump(char *fclass, char *dumpfile)
             }
             break;
         }
+        case 0x04 : { // HPROF_FRAME
+            long long id, mName, mSig, srcFile;
+            char *SmNam, *SmSig, *SsrcFile;
+            cinfo *ci;
+            int serial, lineno;
+
+            id = readIdent(df);
+            mName = readIdent(df);              // methodName
+            mSig = readIdent(df);               // methodSig
+            srcFile = readIdent(df);            // sourceFile
+            readUint(df->fin, &serial);         // classSer
+            readUint(df->fin, &lineno);         // lineNumber
+            SmNam = (char *) trbt_lookup32(df->sbTable, (long) mName);
+            SmSig = (char *) trbt_lookup32(df->sbTable, (long) mSig);
+            SsrcFile = (char *) trbt_lookup32(df->sbTable, (long) srcFile);
+            ci = (cinfo *) trbt_lookup32(df->scTable, (long) serial);
+            printf("[%2d] frame %s %s serial 0x%08x %s %s %d\n", id, SmNam, SmSig, serial, ci->name, SsrcFile, lineno);
+            }
+            break;
         case 0x05 : { // HPROF_TRACE
             int i, serial, threadSeq, frames;
             readUint(df->fin, &serial);             // serialNumber
             readUint(df->fin, &threadSeq);
             readUint(df->fin, &frames);
-            if (debug)
-            printf("trace serial %d %d %d\n", serial, threadSeq, frames);
+            if (1 || debug)
+            printf("trace serial %d tseq: %d %d\n", serial, threadSeq, frames);
             for (i = 0; i < frames; i++) {
                 long long ident = readIdent(df);
-                if (debug)
-                    printf("\tident 0x%x\n", ident);
+                if (3 < debug)
+                printf("    [%2d]  %ld\n",  i, ident);
             }
             break;
         }
         case 0x0c : { // HPROF_HEAP_DUMP
             // printf("heap dump\n");
+            if (debug) puts("");
             readHeap(df, rlen);
             break;
         }
@@ -692,7 +744,7 @@ printClass_r(trbt_node_t *node)
         return;
     printClass_r(node->left);
     ci = (cinfo *) node->data;
-    printf("0x%x instance 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
+    printf("0x%x class 0x%x %d %s\n", ci->ident, ci->nident, ci->count, ci->name);
     printClass_r(node->right);
 }
 
@@ -878,6 +930,8 @@ resolveInstance(struct jdump *jf, hobject *ho)
     ho->resolved = 1;
 
     ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
+    if (!ci->resolved) 
+        resolveClassNode(jf, ci);
 
     if (H_VARRAY == ho->htype) {
         ho->hvalues = talloc_array(ho, union hvalue, ho->count);
@@ -984,9 +1038,9 @@ resolveInstance(struct jdump *jf, hobject *ho)
 }
 
 void
-printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
+printInstance(struct jdump *jf, hobject *ho, int indent, int pshort, int inString)
 {
-    int i;
+    int i, isString;
     cinfo *ci;
 
     if (ho->visit) {
@@ -994,13 +1048,19 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
             ho->instId, ho->classId, ho->osize, ho->osize + ho->csize);
         return;
     }
+    if (1 < indent && 0 != jf->plimit && indent > jf->plimit)
+        return;
     if (H_VARRAY == ho->htype) {
         int def = 0;
-        printf("value array 0x%08x 0x%08x count %d size %d\n",
-            ho->instId, ho->classId, ho->count, ho->osize);
+        printf("value array 0x%08x 0x%08x %d count %d size %d\n",
+            ho->instId, ho->classId, ho->xclassId, ho->count, ho->osize);
         if (ho->count) {
         if (indent) fputs("\t\t", stdout);
         for (i = 0; i < ho->count; i++) {
+            if (100 < i) {
+                printf("[ ... ] %d elements ", ho->count - i);
+                break;
+            }
             switch (ho->xclassId ? ho->xclassId : ho->classId) {
             case 4: case 8: {
                 char *b = (char *) ho->hvalues;
@@ -1010,7 +1070,11 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
                 putchar(*(c + i) >> 8); break; }
             case 9: {
                 unsigned short *c = (unsigned short *) ho->hvalues;
-                printf("%x ", *(c + i)); break; }
+                if (!inString)
+                    printf("%x ", *(c + i)); 
+                else 
+                    printf("%c", *(c + i) >> 8);
+                break; }
             case 10: {
                 unsigned int *pi = (unsigned int *) ho->hvalues;
                 printf("%x ", *(pi + i)); break; }
@@ -1045,7 +1109,7 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
                 if (0 != last_cnt)
                     printf(" [ %d elements ]\n", last_cnt);
                 last_cnt = 0;
-                printInstance(jf, dref, 1 + indent, 1);
+                printInstance(jf, dref, 1 + indent, 0, 0);
             } else if (last_pid != *(pid + i)) {
                 if (0 != last_cnt)
                     printf(" [ %d elements ]\n", last_cnt);
@@ -1067,13 +1131,14 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
 
     ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
     // if (indent) fputs("\t\t", stdout);
-    printf("Instance 0x%08x of 0x%08x %s self %d self+children %d\n",
+    printf("Instance 0x%08x of 0x%08x %s self %d self+children %ld\n",
         ho->instId, ho->classId, ci->name, ho->osize, ho->osize + ho->csize);
     if (pshort)
         return;
     ho->visit = 1;
     if (indent)
         printf("\t\t----> (%d)\n", indent);
+    isString = ci == jf->javaLangString;
     for (i = 0; i < ci->tfields; i++) {
         finfo *info = *(ci->values + i);
         union hvalue *value = ho->hvalues + i;
@@ -1085,7 +1150,7 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
         case 'L' : {
             hobject *dref;
             if (value->ident && (dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident)))
-                printInstance(jf, dref, 1 + indent, 1);
+                printInstance(jf, dref, 1 + indent, 0, isString);
             else if (0 == value->ident)
                 puts("[null]");
             else
@@ -1115,7 +1180,7 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
         case 'L' : {
             hobject *dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident);
             if (dref)
-                printInstance(jf, dref, indent, 0);
+                printInstance(jf, dref, indent, 0, 0);
             break;
             }
         default:  break;
@@ -1125,6 +1190,40 @@ printInstance(struct jdump *jf, hobject *ho, int indent, int pshort)
     return;
 }
 
+void
+printString(struct jdump *jf, hobject *ho)
+{
+    int i;
+    cinfo *ci = (cinfo *) trbt_lookup32(jf->cTable, ho->classId);
+    printf("Instance 0x%08x of 0x%08x %s\n", ho->instId, ho->classId, ci->name);
+    for (i = 0; i < ci->tfields; i++) {
+        finfo *info = *(ci->values + i);
+        union hvalue *value = ho->hvalues + i;
+        
+        printf("\t%3d (%3d): %c %-25s ", i, info->offset, info->ftype, info->name);
+        switch (info->ftype) {
+        case '[' :
+        case 'L' : {
+            hobject *dref;
+            if (value->ident && (dref = (hobject *) trbt_lookup32(jf->hTable, (long) value->ident)))
+                printInstance(jf, dref, 1, 1, 1);
+            else if (0 == value->ident)
+                puts("[null]");
+            else
+                printf("Instance 0x%08x of 0x%08x %s\n", value->ident, 0, "unknown");
+            break;
+        }
+        case 'B' :
+        case 'Z' :  printf(" %d  0x%x\n", value->b, value->b);  break;
+        case 'C' :
+        case 'S' :  printf(" %d  0x%x\n", value->c, value->c);  break;
+        case 'I' :  printf(" %d  0x%x\n", value->i, value->i);  break;
+        case 'J' :  printf(" %ld  0x%lx\n", value->j, value->j);  break;
+        default: puts(" 0 0 ");
+        }
+    }
+}
+
 void 
 printInstances(struct jdump *jf, trbt_node_t *node)
 {
@@ -1132,7 +1231,7 @@ printInstances(struct jdump *jf, trbt_node_t *node)
         return;
     printInstances(jf, node->left);
     printf("begin node %x\n", node->data);
-    printInstance(jf, (hobject *) node->data, 0, 0);
+    printInstance(jf, (hobject *) node->data, 0, 0, 0);
     printf("end node %x\n\n", node->data);
     printInstances(jf, node->right);
 }
@@ -1147,7 +1246,7 @@ collectStats(struct jdump *jf, trbt_node_t *node, unsigned long ckey)
     ho = (hobject *) node->data;
     if (ckey == ho->classId) {
         resolveInstance(jf, ho);
-        printInstance(jf, ho, 0, 0);
+        printInstance(jf, ho, 0, 0, 0);
     }
     collectStats(jf, node->right, ckey);
 }
@@ -1178,7 +1277,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
     jf->javaLangString = findClass(jf, "java/lang/String");
 
     while (0 < hsize && EOF != (rtype = getc(jf->fin))) {
-        long long *iptr;
+        rinfo *ri;
         hsize--;
         switch (rtype) {
         case 0xff : {    // HPROF_GC_ROOT_UNKNOWN
@@ -1194,10 +1293,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &stackSeq);
             hsize -= jf->identsz + 8;
             if (debug)
-            printf("0x%08lx root thread obj 0x%08x 0x%08x\n", id, threadSeq, stackSeq);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+            printf("0x%08lx root thread obj thread:%d stack:%d\n", id, threadSeq, stackSeq);
             // putchar('r');
             roott++;
             break;
@@ -1209,9 +1305,8 @@ readHeap(struct jdump *jf, unsigned int hsize)
             hsize -= jf->identsz + jf->identsz;
             if (debug)
                 printf("0x%08lx root native static 0x%08lx\n", id, gid);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+            ri = mkrinfo(jf->roots, id, 0, ROOT_NATIVE_STATIC, "");
+            trbt_insert32(jf->roots, (long) id, ri);
             // puts("\t heap root native global");
             // putchar('G');
             rootg++;
@@ -1225,10 +1320,9 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &depth);
             hsize -= jf->identsz + 8;
             if (debug)
-                printf("0x%08lx root native local \n", id);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+                printf("0x%08lx root native local thread %d depth %d\n", id, threadSeq, depth);
+            ri = mkrinfo(jf->roots, id, 0, ROOT_NATIVE_LOCAL, "");
+            trbt_insert32(jf->roots, (long) id, ri);
             // puts("\t heap root native local");
             // putchar('L');
             rootl++;
@@ -1242,10 +1336,9 @@ readHeap(struct jdump *jf, unsigned int hsize)
             readUint(jf->fin, &depth);
             hsize -= jf->identsz + 8;
             if (debug)
-                printf("0x%08lx root java local \n", id);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+                printf("0x%08lx root java local thread %d depth %d\n", id, threadSeq, depth);
+            ri = mkrinfo(jf->roots, id, 0, ROOT_JAVA_LOCAL, "");
+            trbt_insert32(jf->roots, (long) id, ri);
             // puts("\t heap root native local");
             // puts("\t heap root java frame");
             // putchar('F');
@@ -1260,9 +1353,8 @@ readHeap(struct jdump *jf, unsigned int hsize)
             hsize -= jf->identsz + 4;
             if (debug)
                 printf("0x%08lx root native stack \n", id);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+            ri = mkrinfo(jf->roots, id, 0, ROOT_NATIVE_STACK, "");
+            trbt_insert32(jf->roots, (long) id, ri);
             // puts("\t heap root native stack");
             // putchar('S');
             stack++;
@@ -1273,9 +1365,8 @@ readHeap(struct jdump *jf, unsigned int hsize)
             hsize -= jf->identsz;
             if (debug)
                 printf("0x%08lx root system class\n", id);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+            ri = mkrinfo(jf->roots, id, 0, ROOT_SYSTEM_CLASS, "");
+            trbt_insert32(jf->roots, (long) id, ri);
             // puts("\t heap root system class");
             // putchar('C');
             sclass++;
@@ -1289,15 +1380,15 @@ readHeap(struct jdump *jf, unsigned int hsize)
             hsize -= jf->identsz + 4;
             if (debug)
                 printf("0x%08lx root thread block\n", id);
-            iptr = (int *) talloc(jf->roots, long long);
-            *iptr = id;
-            trbt_insert32(jf->roots, (long) id, iptr);
+            ri = mkrinfo(jf->roots, id, 0, ROOT_THREAD_BLOCK, "");
+            trbt_insert32(jf->roots, (long) id, ri);
             // puts("\t heap root thread block");
             // putchar('T');
             tblock++;
             break;
         }
         case 0x07 : {    // HPROF_GC_ROOT_MONITOR_USED
+            int *iptr;
             long long id = readIdent(jf);
             hsize -= jf->identsz;
             if (debug)
@@ -1332,6 +1423,13 @@ readHeap(struct jdump *jf, unsigned int hsize)
                 printf("0x%x instance 0x%x %s\n", ide, classId, ci->name);
             // fpos = ftell(jf->fin);
             // cnt = countbytes(jf->fin, isz);
+            if (0 && classId == jf->javaLangString->ident) {
+                ho = makeObj(jf->hTable, H_INSTANCE, ide, classId);
+                ho->fpos = ftello(jf->fin);
+                resolveInstance(jf, ho);
+                printString(jf, ho);
+                talloc_free(ho);
+            }
             if (50000 > ci->count || classId == jf->javaLangString->ident) {
                 ho = makeObj(jf->hTable, H_INSTANCE, ide, classId);
                 ho->fpos = ftello(jf->fin);
@@ -1377,7 +1475,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
     printf("\t%15s : %8d \n", "object array", oarr);
     printf("\t%15s : %8d \n", "primary array", parr);
 
-    resolveClasses(jf);
+    // resolveClasses(jf);
 
     puts("Class Summary");
     printClass_r(jf->cTable->root);
@@ -1397,7 +1495,7 @@ readHeap(struct jdump *jf, unsigned int hsize)
         }
     }
 
-    mg_assemble(jf);
+    // mg_assemble(jf);
 }
 
 Arc *
