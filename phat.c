@@ -22,7 +22,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#if defined(__sun)
+#include <sys/byteorder.h>
+#define bswap_16(x) BSWAP_16(x)
+#define bswap_32(x) BSWAP_32(x)
+#define bswap_64(x) BSWAP_64(x)
+#define __LITTLE_ENDIAN 1234
+#define __BIG_ENDIAN 4321
+#ifdef _LITTLE_ENDIAN
+#define __BYTE_ORDER __LITTLE_ENDIAN
+#else
+#define __BYTE_ORDER __BIG_ENDIAN
+#endif
+#elif defined(__GNUC__)
 #include <endian.h>
+#include <byteswap.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -30,7 +45,9 @@
 #include "talloc.h"
 #include "rbtree.h"
 
+#if !defined(__sun)
 #define _FILE_OFFSET_BITS 64
+#endif
 #define MAGIC_HEADER 0x4a415641   // JAVA
 
 struct jdump {          // java dump
